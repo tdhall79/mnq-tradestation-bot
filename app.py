@@ -12,29 +12,48 @@ app = Flask(__name__)
 # SETTINGS
 # =========================
 
-MAX_CONTRACTS = 3
-DEFAULT_CONTRACTS = 1
-
 TZ = pytz.timezone("America/Chicago")
 
-SESSION_START = time(8,30)
-SESSION_END = time(15,0)
+SESSION_START = time(8,31)
+SESSION_END = time(14,59)
+
+MAX_CONTRACTS = 5
 
 
 # =========================
-# TRADESTATION
+# TRADESTATION SIM
 # =========================
 
-TOKEN = os.getenv("TS_ACCESS_TOKEN")
+CLIENT_ID = os.getenv("TS_CLIENT_ID")
+CLIENT_SECRET = os.getenv("TS_CLIENT_SECRET")
+
+ACCESS_TOKEN = os.getenv("TS_ACCESS_TOKEN")
+
 ACCOUNT = os.getenv("TS_ACCOUNT")
 
 
-BASE_URL = "https://api.tradestation.com/v3"
+BASE_URL = "https://sim-api.tradestation.com/v3"
 
 
 
 # =========================
-# SESSION CHECK
+# AUTH
+# =========================
+
+def auth_headers():
+
+    return {
+        "Authorization":
+        f"Bearer {ACCESS_TOKEN}",
+
+        "Content-Type":
+        "application/json"
+    }
+
+
+
+# =========================
+# SESSION
 # =========================
 
 def market_open():
@@ -46,7 +65,7 @@ def market_open():
 
 
 # =========================
-# GET CURRENT POSITION
+# POSITION
 # =========================
 
 def get_position(symbol):
@@ -57,15 +76,9 @@ def get_position(symbol):
     )
 
 
-    headers = {
-        "Authorization":
-        f"Bearer {TOKEN}"
-    }
-
-
     r = requests.get(
         url,
-        headers=headers
+        headers=auth_headers()
     )
 
 
@@ -73,7 +86,7 @@ def get_position(symbol):
 
 
     print(
-        "POSITION CHECK:",
+        "POSITION:",
         data
     )
 
@@ -82,56 +95,41 @@ def get_position(symbol):
     side = None
 
 
-
     for p in data.get("Positions", []):
 
         if p.get("Symbol") == symbol:
 
-            qty = int(
-                float(
-                    p.get(
-                    "Quantity",
-                    0
-                    )
-                )
+            q = float(
+                p.get("Quantity",0)
             )
 
 
-            if qty > 0:
+            if q > 0:
+
+                qty = int(q)
                 side = "LONG"
 
-            elif qty < 0:
+
+            elif q < 0:
+
+                qty = abs(int(q))
                 side = "SHORT"
 
 
-    return abs(qty), side
+    return qty, side
 
 
 
 # =========================
-# SEND ORDER
+# ORDER
 # =========================
 
-def send_order(
-    symbol,
-    action,
-    qty
-):
-
-    url = (
-        BASE_URL +
-        "/orderexecution/orders"
-    )
+def send_order(symbol, action, contracts):
 
 
-    headers = {
+    if contracts > MAX_CONTRACTS:
 
-        "Authorization":
-        f"Bearer {TOKEN}",
-
-        "Content-Type":
-        "application/json"
-    }
+        contracts = MAX_CONTRACTS
 
 
 
@@ -141,7 +139,7 @@ def send_order(
 
         "Symbol": symbol,
 
-        "Quantity": qty,
+        "Quantity": contracts,
 
         "OrderType": "Market",
 
@@ -161,21 +159,60 @@ def send_order(
     )
 
 
-
     r = requests.post(
-        url,
-        headers=headers,
+
+        BASE_URL +
+        "/orderexecution/orders",
+
+        headers=auth_headers(),
+
         json=payload
     )
 
 
     print(
-        "TRADESTATION:",
+        "TRADESTATION RESPONSE:",
         r.text
     )
 
 
     return r.json()
+
+
+
+# =========================
+# FLATTEN
+# =========================
+
+def flatten(symbol):
+
+    qty, side = get_position(symbol)
+
+
+    if qty == 0:
+
+        return {
+            "status":"already flat"
+        }
+
+
+
+    if side == "LONG":
+
+        return send_order(
+            symbol,
+            "SELL",
+            qty
+        )
+
+
+    if side == "SHORT":
+
+        return send_order(
+            symbol,
+            "BUY",
+            qty
+        )
 
 
 
@@ -199,17 +236,9 @@ def webhook():
     if not data:
 
         return jsonify(
-            {
-            "error":
-            "missing json"
-            }
+            {"error":"missing json"}
         ),400
 
-
-
-    signal = data.get(
-        "signal"
-    )
 
 
     symbol = data.get(
@@ -217,45 +246,45 @@ def webhook():
     )
 
 
+    signal = data.get(
+        "signal"
+    )
+
+
     contracts = int(
         data.get(
             "contracts",
-            DEFAULT_CONTRACTS
+            1
         )
     )
+
+
+    if signal:
+
+        signal = signal.upper().strip()
+
 
 
     if not symbol:
 
         return jsonify(
-            {
-            "error":
-            "missing symbol"
-            }
+            {"error":"missing symbol"}
         ),400
 
 
 
-    if contracts > MAX_CONTRACTS:
-
-        contracts = MAX_CONTRACTS
-
-
+    # outside EvoQ session
 
     if not market_open():
 
+        result = flatten(symbol)
+
         return jsonify(
             {
-            "status":
-            "ignored",
-            "reason":
-            "outside session"
+            "status":"session closed",
+            "flatten":result
             }
         )
-
-
-
-    current_qty, current_side = get_position(symbol)
 
 
 
@@ -263,175 +292,44 @@ def webhook():
 
 
 
-    # =====================
-    # LONG
-    # =====================
+    # LONG + DCA LONG
 
     if signal == "LONG":
 
-
-        # no position
-
-        if current_qty == 0:
-
-
-            result = send_order(
-                symbol,
-                "BUY",
-                contracts
-            )
+        result = send_order(
+            symbol,
+            "BUY",
+            contracts
+        )
 
 
 
-        # already long = DCA
-
-        elif current_side == "LONG":
-
-
-            add = min(
-                contracts,
-                MAX_CONTRACTS-current_qty
-            )
-
-
-            if add <= 0:
-
-                return jsonify(
-                    {
-                    "status":
-                    "max contracts"
-                    }
-                )
-
-
-            result = send_order(
-                symbol,
-                "BUY",
-                add
-            )
-
-
-
-        else:
-
-
-            return jsonify(
-                {
-                "status":
-                "ignored",
-                "reason":
-                "currently short"
-                }
-            )
-
-
-
-    # =====================
-    # SHORT
-    # =====================
+    # SHORT + DCA SHORT
 
     elif signal == "SHORT":
 
-
-        if current_qty == 0:
-
-
-            result = send_order(
-                symbol,
-                "SELLSHORT",
-                contracts
-            )
+        result = send_order(
+            symbol,
+            "SELL",
+            contracts
+        )
 
 
 
-        elif current_side == "SHORT":
-
-
-            add = min(
-                contracts,
-                MAX_CONTRACTS-current_qty
-            )
-
-
-            if add <= 0:
-
-                return jsonify(
-                    {
-                    "status":
-                    "max contracts"
-                    }
-                )
-
-
-            result = send_order(
-                symbol,
-                "SELLSHORT",
-                add
-            )
-
-
-
-        else:
-
-
-            return jsonify(
-                {
-                "status":
-                "ignored",
-                "reason":
-                "currently long"
-                }
-            )
-
-
-
-    # =====================
     # EXIT
-    # =====================
 
     elif signal == "EXIT":
 
-
-        if current_qty == 0:
-
-            return jsonify(
-                {
-                "status":
-                "no position"
-                }
-            )
-
-
-
-        if current_side == "LONG":
-
-
-            result = send_order(
-                symbol,
-                "SELL",
-                current_qty
-            )
-
-
-
-        elif current_side == "SHORT":
-
-
-            result = send_order(
-                symbol,
-                "BUYTOCOVER",
-                current_qty
-            )
+        result = flatten(symbol)
 
 
 
     else:
 
-
         return jsonify(
             {
-            "error":
-            "unknown signal"
+            "error":"unknown signal",
+            "signal":signal
             }
         ),400
 
@@ -439,23 +337,11 @@ def webhook():
 
     return jsonify(
         {
-        "status":
-        "sent",
-
-        "signal":
-        signal,
-
-        "symbol":
-        symbol,
-
-        "contracts":
-        contracts,
-
-        "current_position":
-        current_qty,
-
-        "response":
-        result
+        "status":"sent",
+        "symbol":symbol,
+        "signal":signal,
+        "contracts":contracts,
+        "response":result
         }
     )
 
@@ -464,7 +350,7 @@ def webhook():
 @app.route("/")
 def home():
 
-    return "MNQ TradeStation Bot Running"
+    return "TradeStation Futures SIM Bot Running"
 
 
 
