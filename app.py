@@ -251,6 +251,7 @@ def normalize_signal(signal: Any) -> str | None:
 
     if normalized in {
         "LONG",
+        "Long",
         "OPEN_LONG",
         "BUY",
         "DCA L",
@@ -260,6 +261,7 @@ def normalize_signal(signal: Any) -> str | None:
 
     if normalized in {
         "SHORT",
+        "Short",
         "OPEN_SHORT",
         "SELL",
         "DCA S",
@@ -273,7 +275,9 @@ def normalize_signal(signal: Any) -> str | None:
         "CLOSE_LONG",
         "CLOSE_SHORT",
         "SESSION END",
-        "SESSION_END"
+        "SESSION_END",
+        "TP1",
+        "SL"
     }:
         return "EXIT"
 
