@@ -221,9 +221,30 @@ def clear_tracked_stop_id(symbol: str) -> None:
 # SIGNAL AND SYMBOL PARSING
 # =========================================================
 
+ENABLE_SESSION_FILTER = (
+    os.getenv("ENABLE_SESSION_FILTER", "").strip().lower()
+)
+
 def market_open() -> bool:
+
+    # Force 24-hour trading
+    if ENABLE_SESSION_FILTER == "false":
+        return True
+
+    # Force session-only trading
+    if ENABLE_SESSION_FILTER == "true":
+        current_time = datetime.now(TZ).time()
+        return SESSION_START <= current_time <= SESSION_END
+
+    # Default behavior:
+    # SIM = 24 hours
+    # LIVE = session only
+    if TRADING_MODE == "SIM":
+        return True
+
     current_time = datetime.now(TZ).time()
     return SESSION_START <= current_time <= SESSION_END
+
 
 
 def resolve_symbol(symbol: Any) -> str | None:
