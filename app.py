@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from flask import Flask, jsonify, request
-from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from queue import Queue
 from typing import Any
-import hashlib
 import json
 import math
 import os
@@ -16,20 +13,24 @@ import time as sleep_time
 
 import pytz
 import requests
+from flask import Flask, jsonify, request
 
 
 app = Flask(__name__)
 
 # =========================================================
-# GENERAL SETTINGS
+# CONFIGURATION
 # =========================================================
 
-TZ = pytz.timezone("America/Chicago")
+VERSION = "5.1-target-position"
+
+TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
+TZ = pytz.timezone(TZ_NAME)
 
 SESSION_START = time(8, 31)
 SESSION_END = time(14, 59)
 
-TRADING_MODE = os.getenv("TRADING_MODE", "SIM").upper()
+TRADING_MODE = os.getenv("TRADING_MODE", "SIM").upper().strip()
 BASE_URL = (
     "https://api.tradestation.com/v3"
     if TRADING_MODE == "LIVE"
@@ -37,44 +38,65 @@ BASE_URL = (
 )
 TOKEN_URL = "https://signin.tradestation.com/oauth/token"
 
-CLIENT_ID = os.getenv("TS_CLIENT_ID")
-CLIENT_SECRET = os.getenv("TS_CLIENT_SECRET")
-REFRESH_TOKEN = os.getenv("TS_REFRESH_TOKEN")
-ACCOUNT = os.getenv("TS_ACCOUNT")
+CLIENT_ID = os.getenv("TS_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("TS_CLIENT_SECRET", "").strip()
+REFRESH_TOKEN = os.getenv("TS_REFRESH_TOKEN", "").strip()
+ACCOUNT = os.getenv("TS_ACCOUNT", "").strip()
 
-MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26")
-MGC_SYMBOL = os.getenv("MGC_SYMBOL", "MGCQ26")
+MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26").upper().strip()
+MGC_SYMBOL = os.getenv("MGC_SYMBOL", "MGCQ26").upper().strip()
 
-MAX_CONTRACTS_PER_ORDER = int(
-    os.getenv("MAX_CONTRACTS_PER_ORDER", "10")
+ENABLE_SESSION_FILTER = (
+    os.getenv("ENABLE_SESSION_FILTER", "true").lower().strip() == "true"
 )
-
 BROKER_STOP_ENABLED = (
-    os.getenv("BROKER_STOP_ENABLED", "true").lower() == "true"
+    os.getenv("BROKER_STOP_ENABLED", "true").lower().strip() == "true"
+)
+AUTO_RECONCILE_ENABLED = (
+    os.getenv("AUTO_RECONCILE_ENABLED", "true").lower().strip() == "true"
+)
+AUTO_RECONCILE_ON_START = (
+    os.getenv("AUTO_RECONCILE_ON_START", "true").lower().strip() == "true"
 )
 
 DEFAULT_BROKER_STOP_DOLLARS = float(
     os.getenv("BROKER_STOP_MAX_LOSS_DOLLARS", "100")
 )
-
-ENABLE_SESSION_FILTER = (
-    os.getenv("ENABLE_SESSION_FILTER", "").strip().lower()
+MAX_CONTRACTS_PER_STRATEGY = int(
+    os.getenv("MAX_CONTRACTS_PER_STRATEGY", "10")
+)
+MAX_NET_CONTRACTS = int(
+    os.getenv("MAX_NET_CONTRACTS", "20")
+)
+REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv("REQUEST_TIMEOUT_SECONDS", "15")
+)
+POSITION_SETTLE_SECONDS = float(
+    os.getenv("POSITION_SETTLE_SECONDS", "8")
+)
+RECONCILE_INTERVAL_SECONDS = int(
+    os.getenv("RECONCILE_INTERVAL_SECONDS", "30")
+)
+ORDER_COOLDOWN_SECONDS = int(
+    os.getenv("ORDER_COOLDOWN_SECONDS", "15")
+)
+STALE_EVENT_TOLERANCE_MS = int(
+    os.getenv("STALE_EVENT_TOLERANCE_MS", "2000")
 )
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-REQUEST_TIMEOUT = int(
-    os.getenv("REQUEST_TIMEOUT_SECONDS", "15")
+STATE_FILE = Path(
+    os.getenv("STATE_FILE", "/tmp/strategy_state_v5_1.json")
 )
 
-# Mount a Render persistent disk at /var/data and set:
-# STATE_FILE=/var/data/strategy_state.json
-STATE_FILE = Path(
-    os.getenv("STATE_FILE", "/tmp/strategy_state.json")
-)
+# =========================================================
+# GLOBALS
+# =========================================================
 
 _cached_access_token: str | None = None
 _token_expires_at: datetime | None = None
+token_lock = threading.RLock()
 
 state_lock = threading.RLock()
 symbol_locks: dict[str, threading.RLock] = {}
@@ -84,27 +106,45 @@ event_queue: Queue[dict[str, Any]] = Queue()
 queued_event_ids: set[str] = set()
 queued_event_ids_lock = threading.Lock()
 
+shutdown_event = threading.Event()
+
 
 # =========================================================
 # LOGGING
 # =========================================================
 
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+
+def iso_now() -> str:
+    return now_local().isoformat()
+
+
 def log(message: str) -> None:
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now} CST] {message}", flush=True)
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{stamp} {TZ_NAME}] {message}", flush=True)
+
+
+def log_separator(symbol: str) -> None:
+    log("=" * 68)
+    log(f"SYMBOL: {symbol}")
+    log("=" * 68)
 
 
 # =========================================================
-# STATE STORAGE
+# STATE
 # =========================================================
 
 def empty_state() -> dict[str, Any]:
     return {
+        "version": VERSION,
         "strategies": {},
         "stops": {},
         "processed_events": {},
         "last_results": {},
-        "symbol_session_dates": {}
+        "symbol_session_dates": {},
+        "symbol_runtime": {}
     }
 
 
@@ -117,9 +157,11 @@ def load_state() -> dict[str, Any]:
             with STATE_FILE.open("r", encoding="utf-8") as file:
                 state = json.load(file)
 
-            for key, default in empty_state().items():
-                state.setdefault(key, default)
+            default = empty_state()
+            for key, value in default.items():
+                state.setdefault(key, value)
 
+            state["version"] = VERSION
             return state
 
         except Exception as exc:
@@ -136,9 +178,9 @@ def save_state(state: dict[str, Any]) -> None:
             encoding="utf-8",
             dir=str(STATE_FILE.parent),
             delete=False
-        ) as temporary_file:
-            json.dump(state, temporary_file, indent=2)
-            temporary_path = Path(temporary_file.name)
+        ) as temporary:
+            json.dump(state, temporary, indent=2, sort_keys=True)
+            temporary_path = Path(temporary.name)
 
         temporary_path.replace(STATE_FILE)
 
@@ -154,35 +196,31 @@ def get_symbol_lock(symbol: str) -> threading.RLock:
         return symbol_locks[symbol]
 
 
-def signed_target(side: str | None, qty: int) -> int:
-    if not side or qty <= 0:
-        return 0
-    return qty if side == "LONG" else -qty
-
-
-def target_to_side_qty(target: int) -> tuple[str | None, int]:
+def target_to_side_qty(target: int) -> tuple[str, int]:
     if target > 0:
         return "LONG", target
     if target < 0:
         return "SHORT", abs(target)
-    return None, 0
+    return "FLAT", 0
 
 
-def get_strategy_target(
+def get_strategy_record(
     state: dict[str, Any],
     symbol: str,
     strategy: str
 ) -> dict[str, Any]:
-    key = strategy_key(symbol, strategy)
     return state["strategies"].get(
-        key,
+        strategy_key(symbol, strategy),
         {
             "symbol": symbol,
             "strategy": strategy,
             "target": 0,
-            "side": None,
+            "side": "FLAT",
             "qty": 0,
             "broker_stop_dollars": DEFAULT_BROKER_STOP_DOLLARS,
+            "last_event_time_ms": 0,
+            "last_event_id": None,
+            "session_date": None,
             "updated_at": None
         }
     )
@@ -190,10 +228,14 @@ def get_strategy_target(
 
 def set_strategy_target(
     state: dict[str, Any],
+    *,
     symbol: str,
     strategy: str,
     target: int,
-    broker_stop_dollars: float
+    stop_dollars: float,
+    event_time_ms: int,
+    event_id: str,
+    session_date: str
 ) -> None:
     side, qty = target_to_side_qty(target)
 
@@ -203,119 +245,65 @@ def set_strategy_target(
         "target": int(target),
         "side": side,
         "qty": qty,
-        "broker_stop_dollars": float(broker_stop_dollars),
-        "updated_at": datetime.now(TZ).isoformat()
+        "broker_stop_dollars": float(stop_dollars),
+        "last_event_time_ms": int(event_time_ms),
+        "last_event_id": event_id,
+        "session_date": session_date,
+        "updated_at": iso_now()
     }
 
 
 def clear_symbol_targets(
     state: dict[str, Any],
-    symbol: str
+    symbol: str,
+    session_date: str
 ) -> None:
-    for item in state["strategies"].values():
-        if item.get("symbol") == symbol:
-            item["target"] = 0
-            item["side"] = None
-            item["qty"] = 0
-            item["updated_at"] = datetime.now(TZ).isoformat()
-
-
-def desired_net_target(
-    state: dict[str, Any],
-    symbol: str
-) -> int:
-    total = 0
-    for item in state["strategies"].values():
-        if item.get("symbol") != symbol:
+    for record in state["strategies"].values():
+        if record.get("symbol") != symbol:
             continue
 
-        if "target" in item:
-            total += int(item.get("target", 0))
-        else:
-            total += signed_target(
-                item.get("side"),
-                int(item.get("qty", 0))
-            )
-
-    return total
+        record["target"] = 0
+        record["side"] = "FLAT"
+        record["qty"] = 0
+        record["session_date"] = session_date
+        record["updated_at"] = iso_now()
 
 
-def target_snapshot(
-    state: dict[str, Any],
-    symbol: str
-) -> list[dict[str, Any]]:
-    snapshot = []
-
-    for item in state["strategies"].values():
-        if item.get("symbol") == symbol:
-            snapshot.append(item.copy())
-
-    return sorted(
-        snapshot,
-        key=lambda item: str(item.get("strategy", ""))
+def desired_net_target(state: dict[str, Any], symbol: str) -> int:
+    return sum(
+        int(record.get("target", 0))
+        for record in state["strategies"].values()
+        if record.get("symbol") == symbol
     )
 
 
-def effective_net_stop_dollars(
-    state: dict[str, Any],
-    symbol: str,
-    desired_target: int
-) -> float:
-    """
-    Convert each strategy's total risk into risk per contract,
-    average it across active strategy contracts, then apply that
-    per-contract risk to the absolute net broker quantity.
-
-    Example:
-      2 active strategies, each 1 contract and $100 total risk.
-      Net position 2 -> $200 total broker-stop risk.
-      One long and one short -> net 0 -> no broker stop.
-    """
-    net_qty = abs(desired_target)
-
-    if net_qty == 0:
-        return 0.0
-
-    total_risk = 0.0
-    total_contracts = 0
-
-    for item in state["strategies"].values():
-        if item.get("symbol") != symbol:
-            continue
-
-        target = int(item.get("target", 0))
-        qty = abs(target)
-
-        if qty <= 0:
-            continue
-
-        strategy_total_risk = float(
-            item.get(
-                "broker_stop_dollars",
-                DEFAULT_BROKER_STOP_DOLLARS
-            )
-        )
-
-        risk_per_contract = strategy_total_risk / qty
-        total_risk += risk_per_contract * qty
-        total_contracts += qty
-
-    if total_contracts <= 0:
-        return DEFAULT_BROKER_STOP_DOLLARS * net_qty
-
-    average_risk_per_contract = total_risk / total_contracts
-    return max(1.0, average_risk_per_contract * net_qty)
-
-
-def get_tracked_stop_id(
+def strategy_snapshot(
     state: dict[str, Any],
     symbol: str
-) -> str | None:
+) -> list[dict[str, Any]]:
+    records = [
+        dict(record)
+        for record in state["strategies"].values()
+        if record.get("symbol") == symbol
+    ]
+    return sorted(records, key=lambda item: item.get("strategy", ""))
+
+
+def known_symbols(state: dict[str, Any]) -> list[str]:
+    symbols = {
+        record.get("symbol")
+        for record in state["strategies"].values()
+        if record.get("symbol")
+    }
+    return sorted(symbols)
+
+
+def get_stop_id(state: dict[str, Any], symbol: str) -> str | None:
     value = state["stops"].get(symbol)
     return str(value) if value else None
 
 
-def set_tracked_stop_id(
+def set_stop_id(
     state: dict[str, Any],
     symbol: str,
     order_id: str
@@ -323,160 +311,169 @@ def set_tracked_stop_id(
     state["stops"][symbol] = order_id
 
 
-def clear_tracked_stop_id(
-    state: dict[str, Any],
-    symbol: str
-) -> None:
+def clear_stop_id(state: dict[str, Any], symbol: str) -> None:
     state["stops"].pop(symbol, None)
 
 
-def event_already_processed(
+def runtime_record(
     state: dict[str, Any],
-    event_id: str
-) -> bool:
-    return event_id in state["processed_events"]
+    symbol: str
+) -> dict[str, Any]:
+    return state["symbol_runtime"].setdefault(
+        symbol,
+        {
+            "last_order_at": None,
+            "last_order_epoch": 0.0,
+            "last_reconcile_at": None,
+            "last_error": None
+        }
+    )
 
 
 def mark_event_processed(
     state: dict[str, Any],
     event_id: str,
-    result: dict[str, Any]
+    status: str
 ) -> None:
     state["processed_events"][event_id] = {
-        "processed_at": datetime.now(TZ).isoformat(),
-        "status": result.get("status")
+        "processed_at": iso_now(),
+        "status": status
     }
 
-    # Keep the state file bounded.
-    if len(state["processed_events"]) > 1000:
-        oldest = list(state["processed_events"].keys())[:-750]
-        for key in oldest:
+    if len(state["processed_events"]) > 1500:
+        keys = list(state["processed_events"].keys())
+        for key in keys[:-1000]:
             state["processed_events"].pop(key, None)
 
 
 # =========================================================
-# SESSION, SIGNAL, AND SYMBOL PARSING
+# PARSING AND SESSION
 # =========================================================
 
 def market_open() -> bool:
-    if ENABLE_SESSION_FILTER == "false":
+    if not ENABLE_SESSION_FILTER:
         return True
 
-    if ENABLE_SESSION_FILTER == "true":
-        current_time = datetime.now(TZ).time()
-        return SESSION_START <= current_time <= SESSION_END
-
-    # Default:
-    # SIM = 24 hours
-    # LIVE = configured session only
-    if TRADING_MODE == "SIM":
-        return True
-
-    current_time = datetime.now(TZ).time()
-    return SESSION_START <= current_time <= SESSION_END
+    current = now_local().time()
+    return SESSION_START <= current <= SESSION_END
 
 
-def resolve_symbol(symbol: Any) -> str | None:
-    if not symbol:
+def resolve_symbol(value: Any) -> str | None:
+    if value is None:
         return None
 
-    normalized = str(symbol).upper().strip()
+    symbol = str(value).upper().strip()
 
-    if normalized in {"MNQ", "MNQ1!", "@MNQ"}:
+    if symbol in {"MNQ", "MNQ1!", "@MNQ"}:
         return MNQ_SYMBOL
 
-    if normalized in {"MGC", "MGC1!", "@MGC"}:
+    if symbol in {"MGC", "MGC1!", "@MGC"}:
         return MGC_SYMBOL
 
-    return normalized
+    return symbol or None
 
 
-def normalize_signal(signal: Any) -> str | None:
-    if not signal:
+def normalize_signal(value: Any) -> str | None:
+    if value is None:
         return None
 
-    normalized = str(signal).upper().strip()
+    signal = str(value).upper().strip()
 
-    if normalized in {
-        "LONG", "OPEN_LONG", "BUY", "DCA L", "DCA LONG"
-    }:
+    if signal in {"LONG", "OPEN_LONG", "BUY"}:
         return "LONG"
 
-    if normalized in {
-        "SHORT", "OPEN_SHORT", "SELL", "DCA S", "DCA SHORT"
-    }:
+    if signal in {"SHORT", "OPEN_SHORT", "SELL"}:
         return "SHORT"
 
-    if normalized in {
+    if signal in {
         "EXIT", "CLOSE", "CLOSE_LONG", "CLOSE_SHORT",
-        "SESSION END", "SESSION_END", "TP1", "SL"
+        "SESSION_END", "SESSION END"
     }:
         return "EXIT"
 
-    return normalized
+    return signal
+
+
+def session_date_from_event(event_time_ms: int) -> str:
+    event_time = datetime.fromtimestamp(event_time_ms / 1000, TZ)
+    return event_time.date().isoformat()
+
+
+def parse_event(data: dict[str, Any]) -> dict[str, Any]:
+    symbol = resolve_symbol(data.get("symbol"))
+    signal = normalize_signal(data.get("signal"))
+    strategy = str(data.get("strategy", "")).upper().strip()
+    event_id = str(data.get("event_id", "")).strip()
+
+    if not symbol:
+        raise ValueError("Missing symbol")
+
+    if signal not in {"LONG", "SHORT", "EXIT"}:
+        raise ValueError(f"Unknown signal: {signal}")
+
+    if not strategy:
+        raise ValueError("Missing strategy")
+
+    if not event_id:
+        raise ValueError("Missing event_id")
+
+    try:
+        contracts = int(data.get("contracts", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("contracts must be an integer") from exc
+
+    if contracts < 1 or contracts > MAX_CONTRACTS_PER_STRATEGY:
+        raise ValueError(
+            f"contracts must be between 1 and "
+            f"{MAX_CONTRACTS_PER_STRATEGY}"
+        )
+
+    try:
+        stop_dollars = float(
+            data.get(
+                "broker_stop_dollars",
+                DEFAULT_BROKER_STOP_DOLLARS
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "broker_stop_dollars must be numeric"
+        ) from exc
+
+    try:
+        event_time_ms = int(data.get("event_time_ms"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Missing or invalid event_time_ms") from exc
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "strategy": strategy,
+        "event_id": event_id,
+        "event_time_ms": event_time_ms,
+        "bar_time_ms": int(data.get("bar_time_ms", 0) or 0),
+        "contracts": contracts,
+        "broker_stop_dollars": max(1.0, stop_dollars),
+        "session_date": session_date_from_event(event_time_ms),
+        "received_at": iso_now()
+    }
 
 
 # =========================================================
-# FUTURES SPECIFICATIONS
-# =========================================================
-
-def futures_specs(symbol: str) -> dict[str, float]:
-    normalized = symbol.upper().strip()
-
-    if normalized.startswith("MNQ"):
-        return {"point_value": 2.0, "tick_size": 0.25}
-
-    if normalized.startswith("MGC"):
-        return {"point_value": 10.0, "tick_size": 0.10}
-
-    if normalized.startswith("SIL"):
-        return {"point_value": 1000.0, "tick_size": 0.01}
-
-    if normalized.startswith("QC"):
-        return {"point_value": 12500.0, "tick_size": 0.002}
-
-    if normalized.startswith(("MZS", "MZC", "MZW")):
-        return {"point_value": 5.0, "tick_size": 0.50}
-
-    raise ValueError(
-        f"No futures specifications configured for {symbol}."
-    )
-
-
-def round_to_tick(
-    price: float,
-    side: str,
-    tick_size: float
-) -> float:
-    tick_count = price / tick_size
-
-    if side == "LONG":
-        rounded_ticks = math.floor(tick_count)
-    elif side == "SHORT":
-        rounded_ticks = math.ceil(tick_count)
-    else:
-        raise ValueError(f"Unknown side: {side}")
-
-    return round(rounded_ticks * tick_size, 10)
-
-
-# =========================================================
-# OAUTH
+# TRADESTATION AUTH
 # =========================================================
 
 def validate_environment() -> None:
-    missing = []
-
-    values = {
-        "TS_CLIENT_ID": CLIENT_ID,
-        "TS_CLIENT_SECRET": CLIENT_SECRET,
-        "TS_REFRESH_TOKEN": REFRESH_TOKEN,
-        "TS_ACCOUNT": ACCOUNT
-    }
-
-    for name, value in values.items():
-        if not value:
-            missing.append(name)
+    missing = [
+        name
+        for name, value in {
+            "TS_CLIENT_ID": CLIENT_ID,
+            "TS_CLIENT_SECRET": CLIENT_SECRET,
+            "TS_REFRESH_TOKEN": REFRESH_TOKEN,
+            "TS_ACCOUNT": ACCOUNT
+        }.items()
+        if not value
+    ]
 
     if missing:
         raise RuntimeError(
@@ -488,47 +485,46 @@ def get_access_token() -> str:
     global _cached_access_token, _token_expires_at
 
     validate_environment()
-    now = datetime.now(TZ)
 
-    if (
-        _cached_access_token
-        and _token_expires_at
-        and now < _token_expires_at
-    ):
-        return _cached_access_token
+    with token_lock:
+        now = now_local()
 
-    response = requests.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "refresh_token": REFRESH_TOKEN
-        },
-        timeout=REQUEST_TIMEOUT
-    )
+        if (
+            _cached_access_token
+            and _token_expires_at
+            and now < _token_expires_at
+        ):
+            return _cached_access_token
 
-    log(f"TOKEN STATUS: {response.status_code}")
-
-    if response.status_code != 200:
-        log(f"TOKEN ERROR: {response.text}")
-        raise RuntimeError(
-            "Could not refresh TradeStation access token"
+        response = requests.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "refresh_token": REFRESH_TOKEN
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS
         )
 
-    token_data = response.json()
-    _cached_access_token = token_data["access_token"]
+        log(f"TOKEN STATUS: {response.status_code}")
 
-    expires_in = int(token_data.get("expires_in", 1200))
-    _token_expires_at = now + timedelta(
-        seconds=max(60, expires_in - 60)
-    )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Token refresh failed: {response.text}"
+            )
 
-    log("TOKEN REFRESHED")
-    return _cached_access_token
+        payload = response.json()
+        _cached_access_token = payload["access_token"]
+        expires_in = int(payload.get("expires_in", 1200))
+        _token_expires_at = now + timedelta(
+            seconds=max(60, expires_in - 60)
+        )
+
+        return _cached_access_token
 
 
-def auth_headers() -> dict[str, str]:
+def headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {get_access_token()}",
         "Content-Type": "application/json"
@@ -536,95 +532,49 @@ def auth_headers() -> dict[str, str]:
 
 
 # =========================================================
-# TRADESTATION POSITION LOOKUP
+# BROKER POSITION AND ORDER HELPERS
 # =========================================================
 
-def get_broker_position(
+def broker_position(
     symbol: str
-) -> tuple[int, str | None, float | None]:
+) -> tuple[int, float | None]:
     response = requests.get(
         f"{BASE_URL}/brokerage/accounts/{ACCOUNT}/positions",
-        headers=auth_headers(),
-        timeout=REQUEST_TIMEOUT
+        headers=headers(),
+        timeout=REQUEST_TIMEOUT_SECONDS
     )
-
-    log(f"POSITION STATUS: {response.status_code}")
-    log(f"POSITION RESPONSE: {response.text}")
 
     if response.status_code != 200:
         raise RuntimeError(
-            "Could not fetch TradeStation positions"
+            f"Position request failed: {response.status_code} "
+            f"{response.text}"
         )
 
     for position in response.json().get("Positions", []):
-        if position.get("Symbol", "").upper() != symbol.upper():
+        if str(position.get("Symbol", "")).upper() != symbol.upper():
             continue
 
-        raw_qty = float(position.get("Quantity", 0))
+        raw_qty = float(position.get("Quantity", 0) or 0)
         qty = abs(int(raw_qty))
-
-        long_short = str(
-            position.get("LongShort", "")
-        ).upper()
-
-        avg_raw = position.get("AveragePrice")
-        avg_price = (
-            float(avg_raw)
-            if avg_raw not in (None, "")
+        long_short = str(position.get("LongShort", "")).upper()
+        average_price_raw = position.get("AveragePrice")
+        average_price = (
+            float(average_price_raw)
+            if average_price_raw not in (None, "")
             else None
         )
 
         if long_short.startswith("LONG") or raw_qty > 0:
-            return qty, "LONG", avg_price
+            return qty, average_price
 
         if long_short.startswith("SHORT") or raw_qty < 0:
-            return qty, "SHORT", avg_price
-
-    return 0, None, None
-
-
-def broker_signed_position(symbol: str) -> tuple[int, float | None]:
-    qty, side, avg_price = get_broker_position(symbol)
-
-    if side == "LONG":
-        return qty, avg_price
-
-    if side == "SHORT":
-        return -qty, avg_price
+            return -qty, average_price
 
     return 0, None
 
 
-def wait_for_signed_position(
-    symbol: str,
-    desired_target: int,
-    tries: int = 10,
-    delay: float = 0.50
-) -> tuple[int, float | None]:
-    last = (0, None)
-
-    for _ in range(tries):
-        last = broker_signed_position(symbol)
-
-        if last[0] == desired_target:
-            return last
-
-        sleep_time.sleep(delay)
-
-    return last
-
-
-# =========================================================
-# ORDER HELPERS
-# =========================================================
-
-def response_order_accepted(
-    response_data: dict[str, Any]
-) -> bool:
-    orders = response_data.get("Orders", [])
-
-    if not orders:
-        return False
+def accepted_order_response(payload: dict[str, Any]) -> bool:
+    orders = payload.get("Orders", [])
 
     for order in orders:
         error = str(order.get("Error", "")).upper()
@@ -636,47 +586,29 @@ def response_order_accepted(
         if "failed" in message or "rejected" in message:
             return False
 
-    return any(
-        order.get("OrderID")
-        or "sent order" in str(order.get("Message", "")).lower()
-        for order in orders
-    )
+    return bool(orders)
 
 
-def extract_order_id(
-    response_data: dict[str, Any]
-) -> str | None:
-    for order in response_data.get("Orders", []):
+def extract_order_id(payload: dict[str, Any]) -> str | None:
+    for order in payload.get("Orders", []):
         order_id = order.get("OrderID")
         if order_id:
             return str(order_id)
     return None
 
 
-def send_order(
+def submit_order(
+    *,
     symbol: str,
     action: str,
     quantity: int,
     order_type: str = "Market",
     stop_price: float | None = None
 ) -> dict[str, Any]:
-    quantity = int(quantity)
-
     if quantity <= 0:
         return {
             "accepted": False,
-            "status": "ignored",
-            "reason": "quantity must be positive"
-        }
-
-    if quantity > MAX_CONTRACTS_PER_ORDER:
-        return {
-            "accepted": False,
-            "status": "blocked",
-            "reason": (
-                f"Requested {quantity} exceeds "
-                f"MAX_CONTRACTS_PER_ORDER={MAX_CONTRACTS_PER_ORDER}"
-            )
+            "reason": "Quantity must be positive"
         }
 
     payload: dict[str, Any] = {
@@ -695,83 +627,183 @@ def send_order(
 
     response = requests.post(
         f"{BASE_URL}/orderexecution/orders",
-        headers=auth_headers(),
+        headers=headers(),
         json=payload,
-        timeout=REQUEST_TIMEOUT
+        timeout=REQUEST_TIMEOUT_SECONDS
     )
 
-    log(f"ORDER HTTP STATUS: {response.status_code}")
+    log(f"ORDER HTTP: {response.status_code}")
     log(f"ORDER RESPONSE: {response.text}")
 
     try:
-        response_data = response.json()
+        response_payload = response.json()
     except ValueError:
-        response_data = {"raw_response": response.text}
+        response_payload = {"raw_response": response.text}
 
     return {
         "accepted": (
             response.status_code == 200
-            and response_order_accepted(response_data)
+            and accepted_order_response(response_payload)
         ),
         "http_status": response.status_code,
         "payload": payload,
-        "response": response_data
+        "response": response_payload
     }
 
 
 def cancel_order(order_id: str) -> dict[str, Any]:
     response = requests.delete(
         f"{BASE_URL}/orderexecution/orders/{order_id}",
-        headers=auth_headers(),
-        timeout=REQUEST_TIMEOUT
+        headers=headers(),
+        timeout=REQUEST_TIMEOUT_SECONDS
     )
 
-    log(f"CANCEL ORDER {order_id} STATUS: {response.status_code}")
-    log(f"CANCEL RESPONSE: {response.text}")
-
-    try:
-        response_data = response.json()
-    except ValueError:
-        response_data = {"raw_response": response.text}
+    log(
+        f"CANCEL ORDER {order_id}: "
+        f"{response.status_code} {response.text}"
+    )
 
     return {
         "http_status": response.status_code,
-        "response": response_data
+        "response": response.text
     }
 
 
-def cancel_protective_stop(
+def cancel_tracked_stop(
     state: dict[str, Any],
     symbol: str
 ) -> dict[str, Any]:
-    order_id = get_tracked_stop_id(state, symbol)
+    order_id = get_stop_id(state, symbol)
 
     if not order_id:
-        return {"status": "no protective stop tracked"}
+        return {"status": "no tracked stop"}
 
     result = cancel_order(order_id)
-    clear_tracked_stop_id(state, symbol)
+    clear_stop_id(state, symbol)
     save_state(state)
-
     return result
 
 
-# =========================================================
-# NET BROKER STOP
-# =========================================================
-
-def calculate_stop_price(
+def wait_for_position(
     symbol: str,
-    quantity: int,
-    side: str,
-    average_price: float,
-    total_risk_dollars: float
-) -> float:
-    specs = futures_specs(symbol)
+    expected: int,
+    timeout_seconds: float
+) -> tuple[int, float | None]:
+    deadline = sleep_time.monotonic() + timeout_seconds
+    latest = broker_position(symbol)
 
-    distance = (
-        total_risk_dollars
-        / (quantity * specs["point_value"])
+    while sleep_time.monotonic() < deadline:
+        if latest[0] == expected:
+            return latest
+
+        sleep_time.sleep(0.5)
+        latest = broker_position(symbol)
+
+    return latest
+
+
+# =========================================================
+# FUTURES STOP CALCULATION
+# =========================================================
+
+def futures_specs(symbol: str) -> dict[str, float]:
+    value = symbol.upper()
+
+    if value.startswith("MNQ"):
+        return {"point_value": 2.0, "tick_size": 0.25}
+
+    if value.startswith("MGC"):
+        return {"point_value": 10.0, "tick_size": 0.10}
+
+    raise ValueError(
+        f"Futures specifications are not configured for {symbol}"
+    )
+
+
+def round_stop_to_tick(
+    price: float,
+    side: str,
+    tick_size: float
+) -> float:
+    tick_value = price / tick_size
+
+    if side == "LONG":
+        ticks = math.floor(tick_value)
+    else:
+        ticks = math.ceil(tick_value)
+
+    return round(ticks * tick_size, 10)
+
+
+def effective_net_stop_dollars(
+    state: dict[str, Any],
+    symbol: str,
+    desired_target: int
+) -> float:
+    if desired_target == 0:
+        return 0.0
+
+    same_direction_records = []
+
+    for record in state["strategies"].values():
+        if record.get("symbol") != symbol:
+            continue
+
+        target = int(record.get("target", 0))
+
+        if desired_target > 0 and target > 0:
+            same_direction_records.append(record)
+
+        if desired_target < 0 and target < 0:
+            same_direction_records.append(record)
+
+    if not same_direction_records:
+        return DEFAULT_BROKER_STOP_DOLLARS * abs(desired_target)
+
+    total_risk = sum(
+        float(
+            record.get(
+                "broker_stop_dollars",
+                DEFAULT_BROKER_STOP_DOLLARS
+            )
+        )
+        for record in same_direction_records
+    )
+
+    return max(1.0, total_risk)
+
+
+def place_protective_stop(
+    state: dict[str, Any],
+    symbol: str,
+    desired_target: int
+) -> dict[str, Any]:
+    if not BROKER_STOP_ENABLED:
+        return {"status": "disabled"}
+
+    if desired_target == 0:
+        return cancel_tracked_stop(state, symbol)
+
+    actual, average_price = broker_position(symbol)
+
+    if actual != desired_target or average_price is None:
+        return {
+            "status": "not placed",
+            "reason": "Broker position is not synchronized",
+            "actual": actual,
+            "desired": desired_target
+        }
+
+    specs = futures_specs(symbol)
+    quantity = abs(actual)
+    side = "LONG" if actual > 0 else "SHORT"
+    risk_dollars = effective_net_stop_dollars(
+        state,
+        symbol,
+        desired_target
+    )
+    distance = risk_dollars / (
+        quantity * specs["point_value"]
     )
 
     raw_stop = (
@@ -779,384 +811,443 @@ def calculate_stop_price(
         if side == "LONG"
         else average_price + distance
     )
-
-    return round_to_tick(
+    stop_price = round_stop_to_tick(
         raw_stop,
         side,
         specs["tick_size"]
     )
+    action = "SELL" if side == "LONG" else "BUY"
 
+    cancel_result = cancel_tracked_stop(state, symbol)
 
-def place_net_protective_stop(
-    state: dict[str, Any],
-    symbol: str,
-    desired_target: int
-) -> dict[str, Any]:
-    if not BROKER_STOP_ENABLED:
-        return {"status": "broker stop disabled"}
-
-    if desired_target == 0:
-        return cancel_protective_stop(state, symbol)
-
-    actual_target, average_price = wait_for_signed_position(
-        symbol,
-        desired_target
-    )
-
-    if actual_target != desired_target or average_price is None:
-        return {
-            "status": "stop not placed",
-            "reason": "broker position did not reach desired target",
-            "desired_target": desired_target,
-            "actual_target": actual_target
-        }
-
-    side = "LONG" if desired_target > 0 else "SHORT"
-    quantity = abs(desired_target)
-
-    total_risk = effective_net_stop_dollars(
-        state,
-        symbol,
-        desired_target
-    )
-
-    stop_price = calculate_stop_price(
-        symbol,
-        quantity,
-        side,
-        average_price,
-        total_risk
-    )
-
-    cancel_result = cancel_protective_stop(state, symbol)
-
-    stop_action = "SELL" if side == "LONG" else "BUY"
-
-    log(
-        f"NET STOP: {side} {quantity} {symbol} "
-        f"avg={average_price} stop={stop_price} "
-        f"total_risk=${total_risk:.2f}"
-    )
-
-    stop_result = send_order(
+    result = submit_order(
         symbol=symbol,
-        action=stop_action,
+        action=action,
         quantity=quantity,
         order_type="StopMarket",
         stop_price=stop_price
     )
 
-    if stop_result["accepted"]:
-        order_id = extract_order_id(
-            stop_result["response"]
-        )
-
+    if result["accepted"]:
+        order_id = extract_order_id(result["response"])
         if order_id:
-            set_tracked_stop_id(state, symbol, order_id)
+            set_stop_id(state, symbol, order_id)
             save_state(state)
 
     return {
         "status": (
-            "protective stop submitted"
-            if stop_result["accepted"]
-            else "protective stop rejected"
+            "submitted"
+            if result["accepted"]
+            else "rejected"
         ),
         "side": side,
         "quantity": quantity,
         "average_price": average_price,
         "stop_price": stop_price,
-        "total_risk_dollars": total_risk,
-        "cancel_previous_stop": cancel_result,
-        "stop_order": stop_result
+        "risk_dollars": risk_dollars,
+        "cancel_previous": cancel_result,
+        "order": result
     }
 
 
 # =========================================================
-# TARGET-POSITION EXECUTION
+# TARGET ENGINE
 # =========================================================
 
-def reset_for_new_session_if_needed(
+def reset_for_new_session(
+    state: dict[str, Any],
+    symbol: str,
+    event_session_date: str
+) -> bool:
+    previous_date = state["symbol_session_dates"].get(symbol)
+
+    if previous_date == event_session_date:
+        return False
+
+    log(
+        f"NEW SESSION: {symbol}; "
+        f"{previous_date} -> {event_session_date}. "
+        f"Clearing prior-day strategy targets."
+    )
+
+    clear_symbol_targets(state, symbol, event_session_date)
+    state["symbol_session_dates"][symbol] = event_session_date
+    save_state(state)
+    return True
+
+
+def order_cooldown_active(
+    state: dict[str, Any],
+    symbol: str
+) -> bool:
+    runtime = runtime_record(state, symbol)
+    elapsed = sleep_time.time() - float(
+        runtime.get("last_order_epoch", 0.0)
+    )
+    return elapsed < ORDER_COOLDOWN_SECONDS
+
+
+def stamp_order_time(
     state: dict[str, Any],
     symbol: str
 ) -> None:
-    today = datetime.now(TZ).date().isoformat()
-    previous = state["symbol_session_dates"].get(symbol)
-
-    if previous == today:
-        return
-
-    log(
-        f"NEW SESSION RESET: {symbol}; "
-        f"previous={previous}, current={today}"
-    )
-
-    clear_symbol_targets(state, symbol)
-    state["symbol_session_dates"][symbol] = today
+    runtime = runtime_record(state, symbol)
+    runtime["last_order_at"] = iso_now()
+    runtime["last_order_epoch"] = sleep_time.time()
     save_state(state)
 
 
-def apply_target_event(event: dict[str, Any]) -> dict[str, Any]:
+def reconcile_symbol(
+    symbol: str,
+    *,
+    reason: str,
+    force: bool = False
+) -> dict[str, Any]:
+    with get_symbol_lock(symbol):
+        state = load_state()
+        desired = desired_net_target(state, symbol)
+
+        if abs(desired) > MAX_NET_CONTRACTS:
+            result = {
+                "status": "blocked",
+                "reason": (
+                    f"Desired net {desired} exceeds "
+                    f"MAX_NET_CONTRACTS={MAX_NET_CONTRACTS}"
+                ),
+                "symbol": symbol
+            }
+            state["last_results"][symbol] = result
+            save_state(state)
+            return result
+
+        actual_before, _ = broker_position(symbol)
+        delta = desired - actual_before
+
+        log_separator(symbol)
+        for record in strategy_snapshot(state, symbol):
+            log(
+                f"{record['strategy']}: "
+                f"{record['side']} {record['qty']}"
+            )
+        log(f"DESIRED BROKER: {desired:+d}")
+        log(f"ACTUAL BROKER:  {actual_before:+d}")
+        log(f"REQUIRED DELTA: {delta:+d}")
+        log(f"REASON: {reason}")
+
+        if delta == 0:
+            stop_result = place_protective_stop(
+                state,
+                symbol,
+                desired
+            )
+            result = {
+                "status": "synchronized",
+                "symbol": symbol,
+                "desired": desired,
+                "actual_before": actual_before,
+                "actual_after": actual_before,
+                "delta": 0,
+                "protective_stop": stop_result,
+                "reason": reason,
+                "time": iso_now()
+            }
+            runtime_record(state, symbol)["last_reconcile_at"] = iso_now()
+            state["last_results"][symbol] = result
+            save_state(state)
+            return result
+
+        if not force and order_cooldown_active(state, symbol):
+            result = {
+                "status": "cooldown",
+                "symbol": symbol,
+                "desired": desired,
+                "actual": actual_before,
+                "delta": delta,
+                "reason": reason,
+                "time": iso_now()
+            }
+            state["last_results"][symbol] = result
+            save_state(state)
+            return result
+
+        # Cancel the old net stop before exposure changes.
+        cancel_result = cancel_tracked_stop(state, symbol)
+
+        action = "BUY" if delta > 0 else "SELL"
+        order_result = submit_order(
+            symbol=symbol,
+            action=action,
+            quantity=abs(delta)
+        )
+        stamp_order_time(state, symbol)
+
+        if not order_result["accepted"]:
+            # Restore protection for the position that still exists.
+            actual_after_rejection, _ = broker_position(symbol)
+            restore_stop = place_protective_stop(
+                state,
+                symbol,
+                actual_after_rejection
+            )
+
+            result = {
+                "status": "order rejected",
+                "symbol": symbol,
+                "desired": desired,
+                "actual_before": actual_before,
+                "actual_after": actual_after_rejection,
+                "delta": delta,
+                "order": order_result,
+                "cancel_previous_stop": cancel_result,
+                "restored_stop": restore_stop,
+                "reason": reason,
+                "time": iso_now()
+            }
+            runtime_record(state, symbol)["last_error"] = result
+            state["last_results"][symbol] = result
+            save_state(state)
+            return result
+
+        actual_after, _ = wait_for_position(
+            symbol,
+            desired,
+            POSITION_SETTLE_SECONDS
+        )
+
+        stop_result = place_protective_stop(
+            state,
+            symbol,
+            desired if actual_after == desired else actual_after
+        )
+
+        status = (
+            "synchronized"
+            if actual_after == desired
+            else "pending reconciliation"
+        )
+
+        result = {
+            "status": status,
+            "symbol": symbol,
+            "desired": desired,
+            "actual_before": actual_before,
+            "actual_after": actual_after,
+            "delta": delta,
+            "order": order_result,
+            "cancel_previous_stop": cancel_result,
+            "protective_stop": stop_result,
+            "reason": reason,
+            "time": iso_now()
+        }
+
+        runtime = runtime_record(state, symbol)
+        runtime["last_reconcile_at"] = iso_now()
+        runtime["last_error"] = (
+            None if status == "synchronized" else result
+        )
+        state["last_results"][symbol] = result
+        save_state(state)
+
+        log(f"FINAL STATUS: {status}")
+        log(f"FINAL BROKER: {actual_after:+d}")
+        return result
+
+
+def apply_event(event: dict[str, Any]) -> dict[str, Any]:
     symbol = event["symbol"]
-    strategy = event["strategy"]
-    signal = event["signal"]
-    contracts = event["contracts"]
-    stop_dollars = event["broker_stop_dollars"]
-    event_id = event["event_id"]
 
     with get_symbol_lock(symbol):
         state = load_state()
 
-        if event_already_processed(state, event_id):
+        if event["event_id"] in state["processed_events"]:
             return {
                 "status": "duplicate ignored",
-                "event_id": event_id
+                "event_id": event["event_id"]
             }
 
-        reset_for_new_session_if_needed(state, symbol)
-
-        current = get_strategy_target(
+        reset_for_new_session(
             state,
             symbol,
-            strategy
+            event["session_date"]
         )
 
-        if signal == "LONG":
-            new_target = contracts
-        elif signal == "SHORT":
-            new_target = -contracts
-        elif signal == "EXIT":
-            new_target = 0
+        current = get_strategy_record(
+            state,
+            symbol,
+            event["strategy"]
+        )
+        previous_event_time = int(
+            current.get("last_event_time_ms", 0)
+        )
+
+        if (
+            previous_event_time
+            and event["event_time_ms"] + STALE_EVENT_TOLERANCE_MS
+            < previous_event_time
+        ):
+            result = {
+                "status": "stale event ignored",
+                "event_id": event["event_id"],
+                "event_time_ms": event["event_time_ms"],
+                "previous_event_time_ms": previous_event_time,
+                "strategy": event["strategy"],
+                "symbol": symbol
+            }
+            mark_event_processed(
+                state,
+                event["event_id"],
+                result["status"]
+            )
+            state["last_results"][symbol] = result
+            save_state(state)
+            return result
+
+        if event["signal"] == "LONG":
+            target = event["contracts"]
+        elif event["signal"] == "SHORT":
+            target = -event["contracts"]
         else:
-            raise ValueError(f"Unknown signal: {signal}")
+            target = 0
 
         old_target = int(current.get("target", 0))
 
         set_strategy_target(
             state,
-            symbol,
-            strategy,
-            new_target,
-            stop_dollars
+            symbol=symbol,
+            strategy=event["strategy"],
+            target=target,
+            stop_dollars=event["broker_stop_dollars"],
+            event_time_ms=event["event_time_ms"],
+            event_id=event["event_id"],
+            session_date=event["session_date"]
         )
         save_state(state)
 
-        desired_target = desired_net_target(state, symbol)
-        actual_target, _ = broker_signed_position(symbol)
-        delta = desired_target - actual_target
-
-        log(
-            f"TARGET UPDATE: strategy={strategy} "
-            f"{old_target}->{new_target}; "
-            f"symbol={symbol}; desired_net={desired_target}; "
-            f"actual_net={actual_target}; delta={delta}"
-        )
-
-        # Remove the old net stop before changing broker exposure.
-        cancel_result = cancel_protective_stop(
-            state,
-            symbol
-        )
-
-        order_result: dict[str, Any] | None = None
-
-        if delta != 0:
-            action = "BUY" if delta > 0 else "SELL"
-
-            order_result = send_order(
-                symbol=symbol,
-                action=action,
-                quantity=abs(delta)
-            )
-
-            if not order_result["accepted"]:
-                result = {
-                    "status": "broker adjustment rejected",
-                    "event_id": event_id,
-                    "strategy": strategy,
-                    "signal": signal,
-                    "old_strategy_target": old_target,
-                    "new_strategy_target": new_target,
-                    "desired_net_target": desired_target,
-                    "actual_net_target": actual_target,
-                    "required_delta": delta,
-                    "order": order_result,
-                    "cancel_previous_stop": cancel_result,
-                    "targets": target_snapshot(state, symbol)
-                }
-
-                state["last_results"][symbol] = result
-                mark_event_processed(state, event_id, result)
-                save_state(state)
-                return result
-
-        stop_result = place_net_protective_stop(
-            state,
+        result = reconcile_symbol(
             symbol,
-            desired_target
+            reason=(
+                f"event {event['strategy']} "
+                f"{event['signal']} "
+                f"{old_target:+d}->{target:+d}"
+            ),
+            force=True
         )
 
-        final_actual, _ = broker_signed_position(symbol)
+        state = load_state()
+        result["event_id"] = event["event_id"]
+        result["strategy"] = event["strategy"]
+        result["signal"] = event["signal"]
+        result["old_strategy_target"] = old_target
+        result["new_strategy_target"] = target
+        result["targets"] = strategy_snapshot(state, symbol)
 
-        result = {
-            "status": (
-                "target synchronized"
-                if final_actual == desired_target
-                else "target pending or mismatched"
-            ),
-            "event_id": event_id,
-            "strategy": strategy,
-            "signal": signal,
-            "old_strategy_target": old_target,
-            "new_strategy_target": new_target,
-            "desired_net_target": desired_target,
-            "actual_net_before": actual_target,
-            "required_delta": delta,
-            "actual_net_after": final_actual,
-            "order": order_result,
-            "cancel_previous_stop": cancel_result,
-            "protective_stop": stop_result,
-            "targets": target_snapshot(state, symbol)
-        }
-
+        mark_event_processed(
+            state,
+            event["event_id"],
+            result["status"]
+        )
         state["last_results"][symbol] = result
-        mark_event_processed(state, event_id, result)
         save_state(state)
 
         return result
 
 
 # =========================================================
-# BACKGROUND WORKER
+# BACKGROUND WORKERS
 # =========================================================
 
-def worker_loop() -> None:
-    while True:
+def event_worker() -> None:
+    while not shutdown_event.is_set():
         event = event_queue.get()
 
         try:
             log(
-                f"PROCESSING EVENT: {event['event_id']} "
+                f"EVENT START: {event['event_id']} | "
                 f"{event['strategy']} {event['signal']} "
                 f"{event['symbol']}"
             )
-
-            result = apply_target_event(event)
+            result = apply_event(event)
             log(
-                f"EVENT RESULT: {event['event_id']} "
+                f"EVENT END: {event['event_id']} | "
                 f"{result.get('status')}"
             )
 
         except Exception as exc:
             log(
-                f"EVENT ERROR: {event.get('event_id')} {exc}"
+                f"EVENT ERROR: {event.get('event_id')} | {exc}"
             )
 
             try:
                 state = load_state()
-                symbol = str(event.get("symbol", "UNKNOWN"))
+                symbol = event.get("symbol", "UNKNOWN")
                 state["last_results"][symbol] = {
                     "status": "worker error",
-                    "event_id": event.get("event_id"),
                     "message": str(exc),
-                    "time": datetime.now(TZ).isoformat()
+                    "event_id": event.get("event_id"),
+                    "time": iso_now()
                 }
                 save_state(state)
             except Exception as state_exc:
-                log(f"FAILED TO SAVE WORKER ERROR: {state_exc}")
+                log(f"STATE ERROR AFTER WORKER ERROR: {state_exc}")
 
         finally:
             with queued_event_ids_lock:
-                queued_event_ids.discard(
-                    str(event.get("event_id", ""))
-                )
-
+                queued_event_ids.discard(event.get("event_id", ""))
             event_queue.task_done()
 
 
-worker_thread = threading.Thread(
-    target=worker_loop,
-    name="trade-worker",
+def reconciler_worker() -> None:
+    # Give Gunicorn and OAuth a moment to initialize.
+    sleep_time.sleep(5)
+
+    first_pass = True
+
+    while not shutdown_event.is_set():
+        try:
+            if AUTO_RECONCILE_ENABLED and (
+                market_open() or TRADING_MODE == "SIM"
+            ):
+                state = load_state()
+                symbols = known_symbols(state)
+
+                for symbol in symbols:
+                    if first_pass and not AUTO_RECONCILE_ON_START:
+                        continue
+
+                    try:
+                        reconcile_symbol(
+                            symbol,
+                            reason=(
+                                "startup recovery"
+                                if first_pass
+                                else "periodic self-healing"
+                            ),
+                            force=False
+                        )
+                    except Exception as exc:
+                        log(
+                            f"RECONCILE ERROR {symbol}: {exc}"
+                        )
+
+            first_pass = False
+
+        except Exception as exc:
+            log(f"RECONCILER ERROR: {exc}")
+
+        shutdown_event.wait(RECONCILE_INTERVAL_SECONDS)
+
+
+threading.Thread(
+    target=event_worker,
+    name="event-worker",
     daemon=True
-)
-worker_thread.start()
+).start()
 
-
-# =========================================================
-# EVENT VALIDATION
-# =========================================================
-
-def fallback_event_id(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":")
-    )
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
-    # Include the current second so separate legitimate signals with
-    # identical payloads on different seconds are not collapsed.
-    second = datetime.now(TZ).strftime("%Y%m%d%H%M%S")
-    return f"fallback:{second}:{digest}"
-
-
-def parse_event(data: dict[str, Any]) -> dict[str, Any]:
-    raw_symbol = data.get("symbol")
-    raw_signal = data.get("signal")
-
-    symbol = resolve_symbol(raw_symbol)
-    signal = normalize_signal(raw_signal)
-
-    strategy = str(
-        data.get("strategy", "DEFAULT")
-    ).upper().strip()
-
-    if not symbol:
-        raise ValueError("missing symbol")
-
-    if not signal:
-        raise ValueError("missing signal")
-
-    if signal not in {"LONG", "SHORT", "EXIT"}:
-        raise ValueError(f"unknown signal: {signal}")
-
-    try:
-        contracts = int(data.get("contracts", 1))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("contracts must be an integer") from exc
-
-    if contracts <= 0:
-        raise ValueError("contracts must be positive")
-
-    if contracts > MAX_CONTRACTS_PER_ORDER:
-        raise ValueError(
-            f"contracts exceeds MAX_CONTRACTS_PER_ORDER="
-            f"{MAX_CONTRACTS_PER_ORDER}"
-        )
-
-    try:
-        stop_dollars = float(
-            data.get(
-                "broker_stop_dollars",
-                DEFAULT_BROKER_STOP_DOLLARS
-            )
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "broker_stop_dollars must be numeric"
-        ) from exc
-
-    event_id = str(
-        data.get("event_id") or fallback_event_id(data)
-    ).strip()
-
-    return {
-        "event_id": event_id,
-        "strategy": strategy,
-        "symbol": symbol,
-        "signal": signal,
-        "contracts": contracts,
-        "broker_stop_dollars": max(1.0, stop_dollars),
-        "received_at": datetime.now(TZ).isoformat()
-    }
+threading.Thread(
+    target=reconciler_worker,
+    name="reconciler-worker",
+    daemon=True
+).start()
 
 
 # =========================================================
@@ -1166,8 +1257,8 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
 @app.route("/", methods=["GET"])
 def home():
     return (
-        "TradeStation Futures Bot v5.0 "
-        f"Target-Position Engine | Mode: {TRADING_MODE}",
+        f"TradeStation Futures Bot {VERSION} | "
+        f"Mode: {TRADING_MODE}",
         200
     )
 
@@ -1179,19 +1270,22 @@ def health():
 
         return jsonify({
             "status": "ok",
-            "version": "5.0-target-position",
+            "version": VERSION,
             "mode": TRADING_MODE,
-            "account_configured": bool(ACCOUNT),
             "token_ok": bool(token),
+            "account_configured": bool(ACCOUNT),
             "state_file": str(STATE_FILE),
             "queue_size": event_queue.qsize(),
-            "broker_stop_enabled": BROKER_STOP_ENABLED,
-            "session_filter": ENABLE_SESSION_FILTER or "default"
+            "session_filter_enabled": ENABLE_SESSION_FILTER,
+            "market_open": market_open(),
+            "auto_reconcile_enabled": AUTO_RECONCILE_ENABLED,
+            "broker_stop_enabled": BROKER_STOP_ENABLED
         })
 
     except Exception as exc:
         return jsonify({
             "status": "error",
+            "version": VERSION,
             "message": str(exc)
         }), 500
 
@@ -1199,34 +1293,61 @@ def health():
 @app.route("/state", methods=["GET"])
 def state_view():
     state = load_state()
+    symbols_payload: dict[str, Any] = {}
 
-    symbols = sorted({
-        item.get("symbol")
-        for item in state["strategies"].values()
-        if item.get("symbol")
-    })
+    for symbol in known_symbols(state):
+        desired = desired_net_target(state, symbol)
 
-    broker_positions: dict[str, Any] = {}
-
-    for symbol in symbols:
         try:
-            actual, avg_price = broker_signed_position(symbol)
-            broker_positions[symbol] = {
-                "signed_position": actual,
-                "average_price": avg_price,
-                "desired_target": desired_net_target(
-                    state,
-                    symbol
-                )
-            }
+            actual, average_price = broker_position(symbol)
+            synchronized = actual == desired
+            broker_error = None
         except Exception as exc:
-            broker_positions[symbol] = {
-                "error": str(exc)
-            }
+            actual = None
+            average_price = None
+            synchronized = False
+            broker_error = str(exc)
+
+        desired_side, desired_qty = target_to_side_qty(desired)
+        actual_side, actual_qty = (
+            target_to_side_qty(actual)
+            if actual is not None
+            else ("UNKNOWN", 0)
+        )
+
+        symbols_payload[symbol] = {
+            "strategies": strategy_snapshot(state, symbol),
+            "desired_broker": {
+                "signed": desired,
+                "side": desired_side,
+                "qty": desired_qty
+            },
+            "actual_broker": {
+                "signed": actual,
+                "side": actual_side,
+                "qty": actual_qty,
+                "average_price": average_price,
+                "error": broker_error
+            },
+            "synchronized": synchronized,
+            "tracked_stop_order_id": get_stop_id(
+                state,
+                symbol
+            ),
+            "runtime": state["symbol_runtime"].get(
+                symbol,
+                {}
+            ),
+            "last_result": state["last_results"].get(
+                symbol
+            )
+        }
 
     return jsonify({
-        "state": state,
-        "broker_positions": broker_positions
+        "version": VERSION,
+        "mode": TRADING_MODE,
+        "time": iso_now(),
+        "symbols": symbols_payload
     })
 
 
@@ -1235,145 +1356,86 @@ def manual_reconcile(symbol: str):
     resolved = resolve_symbol(symbol)
 
     if not resolved:
-        return jsonify({"error": "missing symbol"}), 400
+        return jsonify({"error": "Invalid symbol"}), 400
 
-    event = {
-        "event_id": (
-            f"manual-reconcile:"
-            f"{datetime.now(TZ).isoformat()}"
-        ),
-        "strategy": "MANUAL_RECONCILE",
-        "symbol": resolved,
-        "signal": "EXIT",
-        "contracts": 1,
-        "broker_stop_dollars": (
-            DEFAULT_BROKER_STOP_DOLLARS
-        ),
-        "received_at": datetime.now(TZ).isoformat()
-    }
-
-    # Do not change any target; just synchronize actual broker
-    # position to the current desired net target.
-    with get_symbol_lock(resolved):
-        state = load_state()
-        desired = desired_net_target(state, resolved)
-        actual, _ = broker_signed_position(resolved)
-        delta = desired - actual
-
-        cancel_result = cancel_protective_stop(
-            state,
-            resolved
-        )
-
-        order_result = None
-
-        if delta != 0:
-            order_result = send_order(
+    try:
+        return jsonify(
+            reconcile_symbol(
                 resolved,
-                "BUY" if delta > 0 else "SELL",
-                abs(delta)
+                reason="manual reconcile",
+                force=True
             )
-
-        stop_result = place_net_protective_stop(
-            state,
-            resolved,
-            desired
         )
-
-        final_actual, _ = broker_signed_position(resolved)
-
-    return jsonify({
-        "status": "reconciled",
-        "symbol": resolved,
-        "desired": desired,
-        "actual_before": actual,
-        "delta": delta,
-        "actual_after": final_actual,
-        "order": order_result,
-        "cancel_previous_stop": cancel_result,
-        "protective_stop": stop_result
-    })
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "message": str(exc)
+        }), 500
 
 
 @app.route("/flatten/<symbol>", methods=["POST"])
-def manual_flatten(symbol: str):
+def flatten(symbol: str):
     resolved = resolve_symbol(symbol)
 
     if not resolved:
-        return jsonify({"error": "missing symbol"}), 400
+        return jsonify({"error": "Invalid symbol"}), 400
 
     with get_symbol_lock(resolved):
-        state = load_state()
-        clear_symbol_targets(state, resolved)
-        save_state(state)
+        try:
+            state = load_state()
+            today = now_local().date().isoformat()
+            clear_symbol_targets(state, resolved, today)
+            state["symbol_session_dates"][resolved] = today
+            save_state(state)
 
-        actual, _ = broker_signed_position(resolved)
-        cancel_result = cancel_protective_stop(
-            state,
-            resolved
-        )
-
-        order_result = None
-
-        if actual != 0:
-            order_result = send_order(
+            result = reconcile_symbol(
                 resolved,
-                "SELL" if actual > 0 else "BUY",
-                abs(actual)
+                reason="manual flatten",
+                force=True
             )
 
-        final_actual, _ = wait_for_signed_position(
-            resolved,
-            0
-        )
+            return jsonify(result)
 
-    return jsonify({
-        "status": "flatten processed",
-        "symbol": resolved,
-        "actual_before": actual,
-        "actual_after": final_actual,
-        "order": order_result,
-        "cancel_stop": cancel_result
-    })
+        except Exception as exc:
+            return jsonify({
+                "status": "error",
+                "message": str(exc)
+            }), 500
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(
-        force=True,
-        silent=True
-    )
+    data = request.get_json(force=True, silent=True)
 
     log(f"WEBHOOK RECEIVED: {data}")
 
-    if not data:
+    if not isinstance(data, dict):
         return jsonify({
-            "error": "missing or invalid JSON"
+            "error": "Missing or invalid JSON"
         }), 400
 
     if WEBHOOK_SECRET:
-        supplied_secret = str(
-            data.get("secret", "")
-        ).strip()
-
-        if supplied_secret != WEBHOOK_SECRET:
+        supplied = str(data.get("secret", "")).strip()
+        if supplied != WEBHOOK_SECRET:
             return jsonify({
-                "error": "invalid webhook secret"
+                "error": "Invalid webhook secret"
             }), 401
 
     try:
         event = parse_event(data)
     except ValueError as exc:
-        return jsonify({
-            "error": str(exc)
-        }), 400
+        return jsonify({"error": str(exc)}), 400
+
+    if ENABLE_SESSION_FILTER and not market_open():
+        if event["signal"] != "EXIT":
+            return jsonify({
+                "status": "session closed",
+                "event_id": event["event_id"]
+            }), 200
 
     state = load_state()
 
-    if event_already_processed(
-        state,
-        event["event_id"]
-    ):
+    if event["event_id"] in state["processed_events"]:
         return jsonify({
             "status": "duplicate already processed",
             "event_id": event["event_id"]
@@ -1390,9 +1452,6 @@ def webhook():
 
     event_queue.put(event)
 
-    # Return immediately so TradingView does not time out while
-    # TradeStation orders, fills, position polling, and stop
-    # replacement continue in the background.
     return jsonify({
         "status": "accepted",
         "event_id": event["event_id"],
