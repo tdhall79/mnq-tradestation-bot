@@ -22,7 +22,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "5.2-target-position"
+VERSION = "5.3-direct-worker"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -1196,6 +1196,42 @@ def event_worker() -> None:
             event_queue.task_done()
 
 
+def process_event_direct(event: dict[str, Any]) -> None:
+    try:
+        log(
+            f"EVENT START: {event['event_id']} | "
+            f"{event['strategy']} {event['signal']} "
+            f"{event['symbol']}"
+        )
+        result = apply_event(event)
+        log(
+            f"EVENT END: {event['event_id']} | "
+            f"{result.get('status')}"
+        )
+
+    except Exception as exc:
+        log(
+            f"EVENT ERROR: {event.get('event_id')} | {exc}"
+        )
+
+        try:
+            state = load_state()
+            symbol = event.get("symbol", "UNKNOWN")
+            state["last_results"][symbol] = {
+                "status": "direct worker error",
+                "message": str(exc),
+                "event_id": event.get("event_id"),
+                "time": iso_now()
+            }
+            save_state(state)
+        except Exception as state_exc:
+            log(f"STATE ERROR AFTER EVENT ERROR: {state_exc}")
+
+    finally:
+        with queued_event_ids_lock:
+            queued_event_ids.discard(event.get("event_id", ""))
+
+
 def reconciler_worker() -> None:
     # Give Gunicorn and OAuth a moment to initialize.
     sleep_time.sleep(5)
@@ -1299,7 +1335,8 @@ def health():
             "token_ok": bool(token),
             "account_configured": bool(ACCOUNT),
             "state_file": str(STATE_FILE),
-            "queue_size": event_queue.qsize(),
+            "legacy_queue_size": event_queue.qsize(),
+            "active_event_count": len(queued_event_ids),
             "session_filter_enabled": ENABLE_SESSION_FILTER,
             "market_open": market_open(),
             "auto_reconcile_enabled": AUTO_RECONCILE_ENABLED,
@@ -1484,17 +1521,23 @@ def webhook():
 
         queued_event_ids.add(event["event_id"])
 
-    event_queue.put(event)
+    event_thread = threading.Thread(
+        target=process_event_direct,
+        args=(event,),
+        name=f"event-{event['strategy']}",
+        daemon=True
+    )
+    event_thread.start()
+
     log(
-        f"EVENT QUEUED: {event['event_id']} | "
-        f"queue_size={event_queue.qsize()} | "
-        f"worker_alive={event_worker_thread.is_alive() if event_worker_thread else False}"
+        f"EVENT DISPATCHED: {event['event_id']} | "
+        f"thread_alive={event_thread.is_alive()}"
     )
 
     return jsonify({
         "status": "accepted",
         "event_id": event["event_id"],
-        "queue_size": event_queue.qsize()
+        "processing": "direct background thread"
     }), 202
 
 
