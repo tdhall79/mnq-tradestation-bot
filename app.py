@@ -22,7 +22,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.0-safe-events"
+VERSION = "6.1-worker-startup"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -1496,7 +1496,17 @@ def ensure_background_workers() -> None:
             reconciler_thread.start()
 
 
-ensure_background_workers()
+# =========================================================
+# ACTIVE GUNICORN WORKER STARTUP
+# =========================================================
+
+@app.before_request
+def ensure_monitor_in_active_worker() -> None:
+    """
+    Start or verify the monitor inside the actual Flask/Gunicorn worker
+    that is serving this request. worker_start_lock prevents duplicates.
+    """
+    ensure_background_workers()
 
 
 # =========================================================
@@ -1515,6 +1525,13 @@ def home():
 @app.route("/health", methods=["GET"])
 def health():
     try:
+        ensure_background_workers()
+
+        # Give a newly-created thread a fraction of a second to transition
+        # into its running state before reporting health.
+        if reconciler_thread is not None:
+            reconciler_thread.join(timeout=0.05)
+
         token = get_access_token()
 
         return jsonify({
@@ -1534,6 +1551,16 @@ def health():
             "reconciler_alive": (
                 reconciler_thread is not None
                 and reconciler_thread.is_alive()
+            ),
+            "reconciler_thread_name": (
+                reconciler_thread.name
+                if reconciler_thread is not None
+                else None
+            ),
+            "reconciler_thread_ident": (
+                reconciler_thread.ident
+                if reconciler_thread is not None
+                else None
             )
         })
 
@@ -1735,4 +1762,5 @@ def webhook():
 
 
 if __name__ == "__main__":
+    ensure_background_workers()
     app.run(host="0.0.0.0", port=10000)
