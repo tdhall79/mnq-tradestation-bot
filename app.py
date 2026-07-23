@@ -22,7 +22,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "5.4-stable-stops"
+VERSION = "6.0-safe-events"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -55,9 +55,7 @@ BROKER_STOP_ENABLED = (
 AUTO_RECONCILE_ENABLED = (
     os.getenv("AUTO_RECONCILE_ENABLED", "true").lower().strip() == "true"
 )
-AUTO_RECONCILE_ON_START = (
-    os.getenv("AUTO_RECONCILE_ON_START", "true").lower().strip() == "true"
-)
+AUTO_RECONCILE_ON_START = False
 
 DEFAULT_BROKER_STOP_DOLLARS = float(
     os.getenv("BROKER_STOP_MAX_LOSS_DOLLARS", "100")
@@ -76,6 +74,9 @@ POSITION_SETTLE_SECONDS = float(
 )
 RECONCILE_INTERVAL_SECONDS = int(
     os.getenv("RECONCILE_INTERVAL_SECONDS", "30")
+)
+HEARTBEAT_INTERVAL_SECONDS = int(
+    os.getenv("HEARTBEAT_INTERVAL_SECONDS", "600")
 )
 ORDER_COOLDOWN_SECONDS = int(
     os.getenv("ORDER_COOLDOWN_SECONDS", "15")
@@ -388,7 +389,9 @@ def runtime_record(
             "last_order_at": None,
             "last_order_epoch": 0.0,
             "last_reconcile_at": None,
-            "last_error": None
+            "last_error": None,
+            "last_drift_signature": None,
+            "last_heartbeat_epoch": 0.0
         }
     )
 
@@ -988,12 +991,42 @@ def stamp_order_time(
     save_state(state)
 
 
+def clear_targets_after_external_flat(
+    state: dict[str, Any],
+    symbol: str,
+    *,
+    reason: str
+) -> None:
+    today = now_local().date().isoformat()
+    clear_symbol_targets(state, symbol, today)
+    state["symbol_session_dates"][symbol] = today
+    clear_stop_id(state, symbol)
+    state["last_results"][symbol] = {
+        "status": "targets cleared",
+        "symbol": symbol,
+        "reason": reason,
+        "time": iso_now()
+    }
+    save_state(state)
+
+
 def reconcile_symbol(
     symbol: str,
     *,
     reason: str,
-    force: bool = False
+    force: bool = False,
+    allow_market_order: bool = False
 ) -> dict[str, Any]:
+    """
+    Event-driven safety model:
+
+    - TradingView events may change the broker position.
+    - Periodic reconciliation NEVER submits a market order.
+    - If a tracked stop or manual action flattens the broker, old strategy
+      targets are cleared so the bot cannot automatically re-enter.
+    - Periodic reconciliation only verifies state and maintains an
+      unchanged protective stop.
+    """
     with get_symbol_lock(symbol):
         state = load_state()
         desired = desired_net_target(state, symbol)
@@ -1005,25 +1038,115 @@ def reconcile_symbol(
                     f"Desired net {desired} exceeds "
                     f"MAX_NET_CONTRACTS={MAX_NET_CONTRACTS}"
                 ),
-                "symbol": symbol
+                "symbol": symbol,
+                "time": iso_now()
+            }
+            state["last_results"][symbol] = result
+            save_state(state)
+            log(f"BLOCKED {symbol}: {result['reason']}")
+            return result
+
+        actual_before, _ = broker_position(symbol)
+        delta = desired - actual_before
+        runtime = runtime_record(state, symbol)
+        runtime["last_reconcile_at"] = iso_now()
+
+        # PERIODIC / STARTUP MONITORING: never place market orders.
+        if not allow_market_order:
+            # A real broker flatten after the order cooldown means the stop
+            # filled or the user manually closed. Clear stale targets.
+            if (
+                desired != 0
+                and actual_before == 0
+                and not order_cooldown_active(state, symbol)
+            ):
+                clear_targets_after_external_flat(
+                    state,
+                    symbol,
+                    reason=(
+                        "broker flat while strategy targets were active; "
+                        "treated as stop/manual close"
+                    )
+                )
+                log(
+                    f"EXTERNAL FLAT {symbol}: old desired {desired:+d}; "
+                    "targets cleared; waiting for a new webhook"
+                )
+                return {
+                    "status": "external flat accepted",
+                    "symbol": symbol,
+                    "old_desired": desired,
+                    "actual": 0,
+                    "reason": reason,
+                    "time": iso_now()
+                }
+
+            # When synchronized, only ensure the current stop exists.
+            if delta == 0:
+                stop_result = place_protective_stop(
+                    state,
+                    symbol,
+                    desired
+                )
+                result = {
+                    "status": "synchronized",
+                    "symbol": symbol,
+                    "desired": desired,
+                    "actual_before": actual_before,
+                    "actual_after": actual_before,
+                    "delta": 0,
+                    "protective_stop": stop_result,
+                    "reason": reason,
+                    "time": iso_now()
+                }
+                state["last_results"][symbol] = result
+                save_state(state)
+
+                # Quiet heartbeat, at most once per configured interval.
+                now_epoch = sleep_time.time()
+                last_heartbeat = float(
+                    runtime.get("last_heartbeat_epoch", 0.0)
+                )
+                if now_epoch - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                    log(
+                        f"HEARTBEAT {symbol}: desired={desired:+d} "
+                        f"actual={actual_before:+d} stop="
+                        f"{stop_result.get('status')}"
+                    )
+                    runtime["last_heartbeat_epoch"] = now_epoch
+                    save_state(state)
+
+                return result
+
+            # Non-flat mismatch: report once per changed mismatch, but do not
+            # trade. A fresh TradingView event is required to change exposure.
+            signature = f"{desired}:{actual_before}"
+            if runtime.get("last_drift_signature") != signature:
+                log(
+                    f"POSITION DRIFT {symbol}: desired={desired:+d} "
+                    f"actual={actual_before:+d}; NO ORDER SENT; "
+                    "waiting for a new webhook or manual reconcile"
+                )
+                runtime["last_drift_signature"] = signature
+
+            result = {
+                "status": "drift detected - no automatic order",
+                "symbol": symbol,
+                "desired": desired,
+                "actual": actual_before,
+                "delta": delta,
+                "reason": reason,
+                "time": iso_now()
             }
             state["last_results"][symbol] = result
             save_state(state)
             return result
 
-        actual_before, _ = broker_position(symbol)
-        delta = desired - actual_before
-
-        log_separator(symbol)
-        for record in strategy_snapshot(state, symbol):
-            log(
-                f"{record['strategy']}: "
-                f"{record['side']} {record['qty']}"
-            )
-        log(f"DESIRED BROKER: {desired:+d}")
-        log(f"ACTUAL BROKER:  {actual_before:+d}")
-        log(f"REQUIRED DELTA: {delta:+d}")
-        log(f"REASON: {reason}")
+        # EVENT / EXPLICIT MANUAL RECONCILE: position changes are allowed.
+        log(
+            f"TARGET CHANGE {symbol}: desired={desired:+d} "
+            f"actual={actual_before:+d} delta={delta:+d} | {reason}"
+        )
 
         if delta == 0:
             stop_result = place_protective_stop(
@@ -1042,26 +1165,11 @@ def reconcile_symbol(
                 "reason": reason,
                 "time": iso_now()
             }
-            runtime_record(state, symbol)["last_reconcile_at"] = iso_now()
+            runtime["last_drift_signature"] = None
             state["last_results"][symbol] = result
             save_state(state)
             return result
 
-        if not force and order_cooldown_active(state, symbol):
-            result = {
-                "status": "cooldown",
-                "symbol": symbol,
-                "desired": desired,
-                "actual": actual_before,
-                "delta": delta,
-                "reason": reason,
-                "time": iso_now()
-            }
-            state["last_results"][symbol] = result
-            save_state(state)
-            return result
-
-        # Cancel the old net stop before exposure changes.
         cancel_result = cancel_tracked_stop(state, symbol)
 
         action = "BUY" if delta > 0 else "SELL"
@@ -1073,14 +1181,12 @@ def reconcile_symbol(
         stamp_order_time(state, symbol)
 
         if not order_result["accepted"]:
-            # Restore protection for the position that still exists.
             actual_after_rejection, _ = broker_position(symbol)
             restore_stop = place_protective_stop(
                 state,
                 symbol,
                 actual_after_rejection
             )
-
             result = {
                 "status": "order rejected",
                 "symbol": symbol,
@@ -1094,7 +1200,7 @@ def reconcile_symbol(
                 "reason": reason,
                 "time": iso_now()
             }
-            runtime_record(state, symbol)["last_error"] = result
+            runtime["last_error"] = result
             state["last_results"][symbol] = result
             save_state(state)
             return result
@@ -1105,16 +1211,17 @@ def reconcile_symbol(
             POSITION_SETTLE_SECONDS
         )
 
+        stop_target = desired if actual_after == desired else actual_after
         stop_result = place_protective_stop(
             state,
             symbol,
-            desired if actual_after == desired else actual_after
+            stop_target
         )
 
         status = (
             "synchronized"
             if actual_after == desired
-            else "pending reconciliation"
+            else "order accepted; broker not yet synchronized"
         )
 
         result = {
@@ -1131,18 +1238,19 @@ def reconcile_symbol(
             "time": iso_now()
         }
 
-        runtime = runtime_record(state, symbol)
         runtime["last_reconcile_at"] = iso_now()
+        runtime["last_drift_signature"] = None
         runtime["last_error"] = (
             None if status == "synchronized" else result
         )
         state["last_results"][symbol] = result
         save_state(state)
 
-        log(f"FINAL STATUS: {status}")
-        log(f"FINAL BROKER: {actual_after:+d}")
+        log(
+            f"ORDER COMPLETE {symbol}: status={status} "
+            f"broker={actual_after:+d}"
+        )
         return result
-
 
 def apply_event(event: dict[str, Any]) -> dict[str, Any]:
     symbol = event["symbol"]
@@ -1221,7 +1329,8 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
                 f"{event['signal']} "
                 f"{old_target:+d}->{target:+d}"
             ),
-            force=True
+            force=True,
+            allow_market_order=True
         )
 
         state = load_state()
@@ -1345,11 +1454,12 @@ def reconciler_worker() -> None:
                         reconcile_symbol(
                             symbol,
                             reason=(
-                                "startup recovery"
+                                "startup monitor"
                                 if first_pass
-                                else "periodic self-healing"
+                                else "periodic monitor"
                             ),
-                            force=False
+                            force=False,
+                            allow_market_order=False
                         )
                     except Exception as exc:
                         log(
@@ -1370,29 +1480,17 @@ worker_start_lock = threading.Lock()
 
 
 def ensure_background_workers() -> None:
-    global event_worker_thread, reconciler_thread
+    global reconciler_thread
 
     with worker_start_lock:
-        if (
-            event_worker_thread is None
-            or not event_worker_thread.is_alive()
-        ):
-            log("STARTING EVENT WORKER")
-            event_worker_thread = threading.Thread(
-                target=event_worker,
-                name="event-worker",
-                daemon=True
-            )
-            event_worker_thread.start()
-
         if (
             reconciler_thread is None
             or not reconciler_thread.is_alive()
         ):
-            log("STARTING RECONCILER WORKER")
+            log("STARTING MONITOR WORKER")
             reconciler_thread = threading.Thread(
                 target=reconciler_worker,
-                name="reconciler-worker",
+                name="monitor-worker",
                 daemon=True
             )
             reconciler_thread.start()
@@ -1432,10 +1530,7 @@ def health():
             "market_open": market_open(),
             "auto_reconcile_enabled": AUTO_RECONCILE_ENABLED,
             "broker_stop_enabled": BROKER_STOP_ENABLED,
-            "event_worker_alive": (
-                event_worker_thread is not None
-                and event_worker_thread.is_alive()
-            ),
+            "event_processing": "direct serialized threads",
             "reconciler_alive": (
                 reconciler_thread is not None
                 and reconciler_thread.is_alive()
@@ -1523,7 +1618,8 @@ def manual_reconcile(symbol: str):
             reconcile_symbol(
                 resolved,
                 reason="manual reconcile",
-                force=True
+                force=True,
+                allow_market_order=True
             )
         )
     except Exception as exc:
@@ -1551,7 +1647,8 @@ def flatten(symbol: str):
             result = reconcile_symbol(
                 resolved,
                 reason="manual flatten",
-                force=True
+                force=True,
+                allow_market_order=True
             )
 
             return jsonify(result)
@@ -1567,7 +1664,12 @@ def flatten(symbol: str):
 def webhook():
     data = request.get_json(force=True, silent=True)
 
-    log(f"WEBHOOK RECEIVED: {data}")
+    log(
+        "WEBHOOK "
+        f"{data.get('strategy') if isinstance(data, dict) else '?'} "
+        f"{data.get('signal') if isinstance(data, dict) else '?'} "
+        f"{data.get('symbol') if isinstance(data, dict) else '?'}"
+    )
 
     if not isinstance(data, dict):
         return jsonify({
