@@ -22,7 +22,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "5.3-direct-worker"
+VERSION = "5.4-stable-stops"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -141,6 +141,7 @@ def empty_state() -> dict[str, Any]:
         "version": VERSION,
         "strategies": {},
         "stops": {},
+        "stop_details": {},
         "processed_events": {},
         "last_results": {},
         "symbol_session_dates": {},
@@ -306,13 +307,75 @@ def get_stop_id(state: dict[str, Any], symbol: str) -> str | None:
 def set_stop_id(
     state: dict[str, Any],
     symbol: str,
-    order_id: str
+    order_id: str,
+    *,
+    side: str | None = None,
+    quantity: int | None = None,
+    average_price: float | None = None,
+    stop_price: float | None = None,
+    risk_dollars: float | None = None
 ) -> None:
     state["stops"][symbol] = order_id
+
+    if all(
+        value is not None
+        for value in (
+            side,
+            quantity,
+            average_price,
+            stop_price,
+            risk_dollars
+        )
+    ):
+        state["stop_details"][symbol] = {
+            "order_id": str(order_id),
+            "side": str(side),
+            "quantity": int(quantity),
+            "average_price": float(average_price),
+            "stop_price": float(stop_price),
+            "risk_dollars": float(risk_dollars),
+            "updated_at": iso_now()
+        }
 
 
 def clear_stop_id(state: dict[str, Any], symbol: str) -> None:
     state["stops"].pop(symbol, None)
+    state["stop_details"].pop(symbol, None)
+
+
+def stop_is_unchanged(
+    state: dict[str, Any],
+    symbol: str,
+    *,
+    side: str,
+    quantity: int,
+    average_price: float,
+    stop_price: float,
+    risk_dollars: float
+) -> bool:
+    order_id = get_stop_id(state, symbol)
+    details = state["stop_details"].get(symbol)
+
+    if not order_id or not isinstance(details, dict):
+        return False
+
+    return (
+        str(details.get("order_id")) == str(order_id)
+        and details.get("side") == side
+        and int(details.get("quantity", -1)) == int(quantity)
+        and abs(
+            float(details.get("average_price", -1.0))
+            - float(average_price)
+        ) < 0.000001
+        and abs(
+            float(details.get("stop_price", -1.0))
+            - float(stop_price)
+        ) < 0.000001
+        and abs(
+            float(details.get("risk_dollars", -1.0))
+            - float(risk_dollars)
+        ) < 0.000001
+    )
 
 
 def runtime_record(
@@ -818,6 +881,25 @@ def place_protective_stop(
     )
     action = "SELL" if side == "LONG" else "BUY"
 
+    if stop_is_unchanged(
+        state,
+        symbol,
+        side=side,
+        quantity=quantity,
+        average_price=average_price,
+        stop_price=stop_price,
+        risk_dollars=risk_dollars
+    ):
+        return {
+            "status": "unchanged",
+            "side": side,
+            "quantity": quantity,
+            "average_price": average_price,
+            "stop_price": stop_price,
+            "risk_dollars": risk_dollars,
+            "order_id": get_stop_id(state, symbol)
+        }
+
     cancel_result = cancel_tracked_stop(state, symbol)
 
     result = submit_order(
@@ -831,7 +913,16 @@ def place_protective_stop(
     if result["accepted"]:
         order_id = extract_order_id(result["response"])
         if order_id:
-            set_stop_id(state, symbol, order_id)
+            set_stop_id(
+                state,
+                symbol,
+                order_id,
+                side=side,
+                quantity=quantity,
+                average_price=average_price,
+                stop_price=stop_price,
+                risk_dollars=risk_dollars
+            )
             save_state(state)
 
     return {
