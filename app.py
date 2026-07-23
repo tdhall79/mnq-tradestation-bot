@@ -22,7 +22,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "5.1-target-position"
+VERSION = "5.2-target-position"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -1237,17 +1237,41 @@ def reconciler_worker() -> None:
         shutdown_event.wait(RECONCILE_INTERVAL_SECONDS)
 
 
-threading.Thread(
-    target=event_worker,
-    name="event-worker",
-    daemon=True
-).start()
+event_worker_thread: threading.Thread | None = None
+reconciler_thread: threading.Thread | None = None
+worker_start_lock = threading.Lock()
 
-threading.Thread(
-    target=reconciler_worker,
-    name="reconciler-worker",
-    daemon=True
-).start()
+
+def ensure_background_workers() -> None:
+    global event_worker_thread, reconciler_thread
+
+    with worker_start_lock:
+        if (
+            event_worker_thread is None
+            or not event_worker_thread.is_alive()
+        ):
+            log("STARTING EVENT WORKER")
+            event_worker_thread = threading.Thread(
+                target=event_worker,
+                name="event-worker",
+                daemon=True
+            )
+            event_worker_thread.start()
+
+        if (
+            reconciler_thread is None
+            or not reconciler_thread.is_alive()
+        ):
+            log("STARTING RECONCILER WORKER")
+            reconciler_thread = threading.Thread(
+                target=reconciler_worker,
+                name="reconciler-worker",
+                daemon=True
+            )
+            reconciler_thread.start()
+
+
+ensure_background_workers()
 
 
 # =========================================================
@@ -1279,7 +1303,15 @@ def health():
             "session_filter_enabled": ENABLE_SESSION_FILTER,
             "market_open": market_open(),
             "auto_reconcile_enabled": AUTO_RECONCILE_ENABLED,
-            "broker_stop_enabled": BROKER_STOP_ENABLED
+            "broker_stop_enabled": BROKER_STOP_ENABLED,
+            "event_worker_alive": (
+                event_worker_thread is not None
+                and event_worker_thread.is_alive()
+            ),
+            "reconciler_alive": (
+                reconciler_thread is not None
+                and reconciler_thread.is_alive()
+            )
         })
 
     except Exception as exc:
@@ -1441,6 +1473,8 @@ def webhook():
             "event_id": event["event_id"]
         }), 200
 
+    ensure_background_workers()
+
     with queued_event_ids_lock:
         if event["event_id"] in queued_event_ids:
             return jsonify({
@@ -1451,6 +1485,11 @@ def webhook():
         queued_event_ids.add(event["event_id"])
 
     event_queue.put(event)
+    log(
+        f"EVENT QUEUED: {event['event_id']} | "
+        f"queue_size={event_queue.qsize()} | "
+        f"worker_alive={event_worker_thread.is_alive() if event_worker_thread else False}"
+    )
 
     return jsonify({
         "status": "accepted",
