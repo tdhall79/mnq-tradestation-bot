@@ -22,7 +22,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.1-worker-startup"
+VERSION = "6.2-mes-sil"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -45,6 +45,8 @@ ACCOUNT = os.getenv("TS_ACCOUNT", "").strip()
 
 MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26").upper().strip()
 MGC_SYMBOL = os.getenv("MGC_SYMBOL", "MGCQ26").upper().strip()
+MES_SYMBOL = os.getenv("MES_SYMBOL", "MESU26").upper().strip()
+SIL_SYMBOL = os.getenv("SIL_SYMBOL", "SILQ26").upper().strip()
 
 ENABLE_SESSION_FILTER = (
     os.getenv("ENABLE_SESSION_FILTER", "true").lower().strip() == "true"
@@ -436,6 +438,12 @@ def resolve_symbol(value: Any) -> str | None:
     if symbol in {"MGC", "MGC1!", "@MGC"}:
         return MGC_SYMBOL
 
+    if symbol in {"MES", "MES1!", "@MES"}:
+        return MES_SYMBOL
+
+    if symbol in {"SIL", "SIL1!", "@SIL"}:
+        return SIL_SYMBOL
+
     return symbol or None
 
 
@@ -780,6 +788,12 @@ def futures_specs(symbol: str) -> dict[str, float]:
 
     if value.startswith("MGC"):
         return {"point_value": 10.0, "tick_size": 0.10}
+
+    if value.startswith("MES"):
+        return {"point_value": 5.0, "tick_size": 0.25}
+
+    if value.startswith("SIL"):
+        return {"point_value": 1000.0, "tick_size": 0.005}
 
     raise ValueError(
         f"Futures specifications are not configured for {symbol}"
