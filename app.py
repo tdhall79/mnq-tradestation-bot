@@ -27,7 +27,7 @@ VERSION = "6.2-mes-sil"
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
 
-SESSION_START = time(8, 31)
+SESSION_START = time(8, 30)
 SESSION_END = time(14, 59)
 
 TRADING_MODE = os.getenv("TRADING_MODE", "SIM").upper().strip()
