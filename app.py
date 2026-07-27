@@ -22,12 +22,12 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.2-mes-sil"
+VERSION = "6.3-exit-short"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
 
-SESSION_START = time(8, 30)
+SESSION_START = time(8, 31)
 SESSION_END = time(14, 59)
 
 TRADING_MODE = os.getenv("TRADING_MODE", "SIM").upper().strip()
@@ -459,10 +459,16 @@ def normalize_signal(value: Any) -> str | None:
     if signal in {"SHORT", "OPEN_SHORT", "SELL"}:
         return "SHORT"
 
-    if signal in {
-        "EXIT", "CLOSE", "CLOSE_LONG", "CLOSE_SHORT",
-        "SESSION_END", "SESSION END"
-    }:
+    # Preserve the existing generic EXIT behavior used by the EMA Pine.
+    if signal in {"EXIT", "EXIT_LONG", "CLOSE", "CLOSE_LONG"}:
+        return "EXIT"
+
+    # AlgoPro labels its short-side close separately.
+    if signal in {"EXIT_SHORT", "CLOSE_SHORT"}:
+        return "EXIT_SHORT"
+
+    # Session-end remains a direction-neutral full strategy exit.
+    if signal in {"SESSION_END", "SESSION END"}:
         return "EXIT"
 
     return signal
@@ -482,7 +488,7 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         raise ValueError("Missing symbol")
 
-    if signal not in {"LONG", "SHORT", "EXIT"}:
+    if signal not in {"LONG", "SHORT", "EXIT", "EXIT_SHORT"}:
         raise ValueError(f"Unknown signal: {signal}")
 
     if not strategy:
@@ -1319,8 +1325,13 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
             target = event["contracts"]
         elif event["signal"] == "SHORT":
             target = -event["contracts"]
-        else:
+        elif event["signal"] in {"EXIT", "EXIT_SHORT"}:
             target = 0
+        else:
+            # parse_event() rejects unknown signals before this point.
+            raise ValueError(
+                f"Unhandled signal: {event['signal']}"
+            )
 
         old_target = int(current.get("target", 0))
 
@@ -1730,7 +1741,7 @@ def webhook():
         return jsonify({"error": str(exc)}), 400
 
     if ENABLE_SESSION_FILTER and not market_open():
-        if event["signal"] != "EXIT":
+        if event["signal"] not in {"EXIT", "EXIT_SHORT"}:
             return jsonify({
                 "status": "session closed",
                 "event_id": event["event_id"]
