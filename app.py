@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from queue import Queue
 from typing import Any
+import hashlib
 import json
 import math
 import os
@@ -22,7 +23,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.3-exit-short"
+VERSION = "6.4-algopro-simple"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -452,26 +453,36 @@ def normalize_signal(value: Any) -> str | None:
         return None
 
     signal = str(value).upper().strip()
+    signal = " ".join(signal.replace("-", " ").split())
 
-    if signal in {"LONG", "OPEN_LONG", "BUY"}:
+    if signal in {"LONG", "OPEN LONG", "BUY"}:
         return "LONG"
 
-    if signal in {"SHORT", "OPEN_SHORT", "SELL"}:
+    if signal in {"SHORT", "OPEN SHORT", "SELL"}:
         return "SHORT"
 
-    # Preserve the existing generic EXIT behavior used by the EMA Pine.
-    if signal in {"EXIT", "EXIT_LONG", "CLOSE", "CLOSE_LONG"}:
+    # Existing EMA alerts continue using the generic EXIT signal.
+    if signal in {
+        "EXIT",
+        "EXIT LONG",
+        "LONG EXIT",
+        "CLOSE",
+        "CLOSE LONG"
+    }:
         return "EXIT"
 
-    # AlgoPro labels its short-side close separately.
-    if signal in {"EXIT_SHORT", "CLOSE_SHORT"}:
+    # AlgoPro may label this command Short Exit.
+    if signal in {
+        "EXIT SHORT",
+        "SHORT EXIT",
+        "CLOSE SHORT"
+    }:
         return "EXIT_SHORT"
 
-    # Session-end remains a direction-neutral full strategy exit.
-    if signal in {"SESSION_END", "SESSION END"}:
+    if signal in {"SESSION END", "SESSION_END"}:
         return "EXIT"
 
-    return signal
+    return signal.replace(" ", "_")
 
 
 def session_date_from_event(event_time_ms: int) -> str:
@@ -479,11 +490,44 @@ def session_date_from_event(event_time_ms: int) -> str:
     return event_time.date().isoformat()
 
 
+def automatic_event_id(
+    data: dict[str, Any],
+    *,
+    symbol: str,
+    signal: str,
+    strategy: str,
+    contracts: int
+) -> str:
+    """
+    Create a short-lived deterministic ID for simple AlgoPro messages.
+
+    Identical messages received in the same five-second window receive
+    the same ID, which protects against immediate webhook retries.
+    """
+    bucket = int(sleep_time.time() // 5)
+    canonical = json.dumps(
+        {
+            "symbol": symbol,
+            "signal": signal,
+            "strategy": strategy,
+            "contracts": contracts,
+            "bucket": bucket
+        },
+        sort_keys=True,
+        separators=(",", ":")
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+    return f"AUTO-{digest}"
+
+
 def parse_event(data: dict[str, Any]) -> dict[str, Any]:
-    symbol = resolve_symbol(data.get("symbol"))
+    symbol = resolve_symbol(
+        data.get("symbol", data.get("ticker"))
+    )
     signal = normalize_signal(data.get("signal"))
-    strategy = str(data.get("strategy", "")).upper().strip()
-    event_id = str(data.get("event_id", "")).strip()
+    strategy = str(
+        data.get("strategy", "ALGOPRO")
+    ).upper().strip()
 
     if not symbol:
         raise ValueError("Missing symbol")
@@ -493,9 +537,6 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
 
     if not strategy:
         raise ValueError("Missing strategy")
-
-    if not event_id:
-        raise ValueError("Missing event_id")
 
     try:
         contracts = int(data.get("contracts", 1))
@@ -520,10 +561,32 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
             "broker_stop_dollars must be numeric"
         ) from exc
 
+    received_time_ms = int(sleep_time.time() * 1000)
+    raw_event_time = data.get("event_time_ms")
+
+    if raw_event_time in (None, ""):
+        event_time_ms = received_time_ms
+    else:
+        try:
+            event_time_ms = int(raw_event_time)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("event_time_ms must be an integer") from exc
+
+    event_id = str(data.get("event_id", "")).strip()
+    if not event_id:
+        event_id = automatic_event_id(
+            data,
+            symbol=symbol,
+            signal=signal,
+            strategy=strategy,
+            contracts=contracts
+        )
+
+    raw_bar_time = data.get("bar_time_ms", 0)
     try:
-        event_time_ms = int(data.get("event_time_ms"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Missing or invalid event_time_ms") from exc
+        bar_time_ms = int(raw_bar_time or 0)
+    except (TypeError, ValueError):
+        bar_time_ms = 0
 
     return {
         "symbol": symbol,
@@ -531,7 +594,7 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
         "strategy": strategy,
         "event_id": event_id,
         "event_time_ms": event_time_ms,
-        "bar_time_ms": int(data.get("bar_time_ms", 0) or 0),
+        "bar_time_ms": bar_time_ms,
         "contracts": contracts,
         "broker_stop_dollars": max(1.0, stop_dollars),
         "session_date": session_date_from_event(event_time_ms),
@@ -1328,7 +1391,6 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
         elif event["signal"] in {"EXIT", "EXIT_SHORT"}:
             target = 0
         else:
-            # parse_event() rejects unknown signals before this point.
             raise ValueError(
                 f"Unhandled signal: {event['signal']}"
             )
