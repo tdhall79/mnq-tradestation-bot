@@ -28,7 +28,7 @@ VERSION = "6.4-algopro-simple"
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
 
-SESSION_START = time(8, 31)
+SESSION_START = time(8, 00)
 SESSION_END = time(14, 59)
 
 TRADING_MODE = os.getenv("TRADING_MODE", "SIM").upper().strip()
@@ -61,7 +61,7 @@ AUTO_RECONCILE_ENABLED = (
 AUTO_RECONCILE_ON_START = False
 
 DEFAULT_BROKER_STOP_DOLLARS = float(
-    os.getenv("BROKER_STOP_MAX_LOSS_DOLLARS", "100")
+    os.getenv("BROKER_STOP_MAX_LOSS_DOLLARS", "350")
 )
 MAX_CONTRACTS_PER_STRATEGY = int(
     os.getenv("MAX_CONTRACTS_PER_STRATEGY", "10")
