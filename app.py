@@ -23,7 +23,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.4-algopro-simple"
+VERSION = "6.5-multi-account-routing"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -42,7 +42,25 @@ TOKEN_URL = "https://signin.tradestation.com/oauth/token"
 CLIENT_ID = os.getenv("TS_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("TS_CLIENT_SECRET", "").strip()
 REFRESH_TOKEN = os.getenv("TS_REFRESH_TOKEN", "").strip()
-ACCOUNT = os.getenv("TS_ACCOUNT", "").strip()
+ACCOUNT_1 = os.getenv("TS_ACCOUNT_1", "").strip()
+ACCOUNT_2 = os.getenv("TS_ACCOUNT_2", "").strip()
+ACCOUNT_3 = os.getenv("TS_ACCOUNT_3", "").strip()
+
+STRATEGY_ACCOUNT_MAP = {
+    # Account 1
+    "MGC 1M": ACCOUNT_1,
+    "MNQ 5M BUFFER": ACCOUNT_1,
+    "ALGOPRO_SIGNALS 5B": ACCOUNT_1,
+
+    # Account 2
+    "MGC 1M BUFFER": ACCOUNT_2,
+    "ALGOPRO_2M A": ACCOUNT_2,
+    "MNQ 1M BUFFER": ACCOUNT_2,
+
+    # Account 3
+    "MNQ 2M BUFFER": ACCOUNT_3,
+    "MGC 2M BUFFER": ACCOUNT_3,
+}
 
 MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26").upper().strip()
 MGC_SYMBOL = os.getenv("MGC_SYMBOL", "MGCQ26").upper().strip()
@@ -111,6 +129,20 @@ queued_event_ids: set[str] = set()
 queued_event_ids_lock = threading.Lock()
 
 shutdown_event = threading.Event()
+
+_account_context = threading.local()
+
+def set_current_account(account: str) -> None:
+    _account_context.account = account
+
+def current_account() -> str:
+    account = getattr(_account_context, "account", "")
+    if not account:
+        raise RuntimeError("No TradeStation account is active for this operation")
+    return account
+
+def account_symbol_key(symbol: str) -> str:
+    return f"{current_account()}:{symbol}"
 
 
 # =========================================================
@@ -190,8 +222,18 @@ def save_state(state: dict[str, Any]) -> None:
         temporary_path.replace(STATE_FILE)
 
 
+def normalize_strategy_name(value: Any) -> str:
+    return " ".join(str(value).upper().strip().split())
+
+def account_for_strategy(strategy: str) -> str:
+    key = normalize_strategy_name(strategy)
+    account = STRATEGY_ACCOUNT_MAP.get(key, "")
+    if not account:
+        raise ValueError(f"No TradeStation account route configured for strategy: {strategy}")
+    return account
+
 def strategy_key(symbol: str, strategy: str) -> str:
-    return f"{symbol}:{strategy}"
+    return f"{current_account()}:{symbol}:{normalize_strategy_name(strategy)}"
 
 
 def get_symbol_lock(symbol: str) -> threading.RLock:
@@ -217,8 +259,9 @@ def get_strategy_record(
     return state["strategies"].get(
         strategy_key(symbol, strategy),
         {
+            "account": current_account(),
             "symbol": symbol,
-            "strategy": strategy,
+            "strategy": normalize_strategy_name(strategy),
             "target": 0,
             "side": "FLAT",
             "qty": 0,
@@ -245,8 +288,9 @@ def set_strategy_target(
     side, qty = target_to_side_qty(target)
 
     state["strategies"][strategy_key(symbol, strategy)] = {
+        "account": current_account(),
         "symbol": symbol,
-        "strategy": strategy,
+        "strategy": normalize_strategy_name(strategy),
         "target": int(target),
         "side": side,
         "qty": qty,
@@ -263,10 +307,10 @@ def clear_symbol_targets(
     symbol: str,
     session_date: str
 ) -> None:
+    account = current_account()
     for record in state["strategies"].values():
-        if record.get("symbol") != symbol:
+        if record.get("account") != account or record.get("symbol") != symbol:
             continue
-
         record["target"] = 0
         record["side"] = "FLAT"
         record["qty"] = 0
@@ -275,10 +319,11 @@ def clear_symbol_targets(
 
 
 def desired_net_target(state: dict[str, Any], symbol: str) -> int:
+    account = current_account()
     return sum(
         int(record.get("target", 0))
         for record in state["strategies"].values()
-        if record.get("symbol") == symbol
+        if record.get("account") == account and record.get("symbol") == symbol
     )
 
 
@@ -286,25 +331,26 @@ def strategy_snapshot(
     state: dict[str, Any],
     symbol: str
 ) -> list[dict[str, Any]]:
+    account = current_account()
     records = [
         dict(record)
         for record in state["strategies"].values()
-        if record.get("symbol") == symbol
+        if record.get("account") == account and record.get("symbol") == symbol
     ]
     return sorted(records, key=lambda item: item.get("strategy", ""))
 
 
-def known_symbols(state: dict[str, Any]) -> list[str]:
-    symbols = {
-        record.get("symbol")
+def known_account_symbols(state: dict[str, Any]) -> list[tuple[str, str]]:
+    pairs = {
+        (record.get("account"), record.get("symbol"))
         for record in state["strategies"].values()
-        if record.get("symbol")
+        if record.get("account") and record.get("symbol")
     }
-    return sorted(symbols)
+    return sorted(pairs)
 
 
 def get_stop_id(state: dict[str, Any], symbol: str) -> str | None:
-    value = state["stops"].get(symbol)
+    value = state["stops"].get(account_symbol_key(symbol))
     return str(value) if value else None
 
 
@@ -319,7 +365,7 @@ def set_stop_id(
     stop_price: float | None = None,
     risk_dollars: float | None = None
 ) -> None:
-    state["stops"][symbol] = order_id
+    state["stops"][account_symbol_key(symbol)] = order_id
 
     if all(
         value is not None
@@ -331,7 +377,7 @@ def set_stop_id(
             risk_dollars
         )
     ):
-        state["stop_details"][symbol] = {
+        state["stop_details"][account_symbol_key(symbol)] = {
             "order_id": str(order_id),
             "side": str(side),
             "quantity": int(quantity),
@@ -343,8 +389,8 @@ def set_stop_id(
 
 
 def clear_stop_id(state: dict[str, Any], symbol: str) -> None:
-    state["stops"].pop(symbol, None)
-    state["stop_details"].pop(symbol, None)
+    state["stops"].pop(account_symbol_key(symbol), None)
+    state["stop_details"].pop(account_symbol_key(symbol), None)
 
 
 def stop_is_unchanged(
@@ -358,7 +404,7 @@ def stop_is_unchanged(
     risk_dollars: float
 ) -> bool:
     order_id = get_stop_id(state, symbol)
-    details = state["stop_details"].get(symbol)
+    details = state["stop_details"].get(account_symbol_key(symbol))
 
     if not order_id or not isinstance(details, dict):
         return False
@@ -387,7 +433,7 @@ def runtime_record(
     symbol: str
 ) -> dict[str, Any]:
     return state["symbol_runtime"].setdefault(
-        symbol,
+        account_symbol_key(symbol),
         {
             "last_order_at": None,
             "last_order_epoch": 0.0,
@@ -525,9 +571,9 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
         data.get("symbol", data.get("ticker"))
     )
     signal = normalize_signal(data.get("signal"))
-    strategy = str(
+    strategy = normalize_strategy_name(
         data.get("strategy", "ALGOPRO")
-    ).upper().strip()
+    )
 
     if not symbol:
         raise ValueError("Missing symbol")
@@ -537,6 +583,8 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
 
     if not strategy:
         raise ValueError("Missing strategy")
+
+    account = account_for_strategy(strategy)
 
     try:
         contracts = int(data.get("contracts", 1))
@@ -589,6 +637,7 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
         bar_time_ms = 0
 
     return {
+        "account": account,
         "symbol": symbol,
         "signal": signal,
         "strategy": strategy,
@@ -613,7 +662,9 @@ def validate_environment() -> None:
             "TS_CLIENT_ID": CLIENT_ID,
             "TS_CLIENT_SECRET": CLIENT_SECRET,
             "TS_REFRESH_TOKEN": REFRESH_TOKEN,
-            "TS_ACCOUNT": ACCOUNT
+            "TS_ACCOUNT_1": ACCOUNT_1,
+            "TS_ACCOUNT_2": ACCOUNT_2,
+            "TS_ACCOUNT_3": ACCOUNT_3
         }.items()
         if not value
     ]
@@ -682,7 +733,7 @@ def broker_position(
     symbol: str
 ) -> tuple[int, float | None]:
     response = requests.get(
-        f"{BASE_URL}/brokerage/accounts/{ACCOUNT}/positions",
+        f"{BASE_URL}/brokerage/accounts/{current_account()}/positions",
         headers=headers(),
         timeout=REQUEST_TIMEOUT_SECONDS
     )
@@ -755,7 +806,7 @@ def submit_order(
         }
 
     payload: dict[str, Any] = {
-        "AccountID": ACCOUNT,
+        "AccountID": current_account(),
         "Symbol": symbol,
         "Quantity": str(quantity),
         "OrderType": order_type,
@@ -894,8 +945,10 @@ def effective_net_stop_dollars(
 
     same_direction_records = []
 
+    account = current_account()
+
     for record in state["strategies"].values():
-        if record.get("symbol") != symbol:
+        if record.get("account") != account or record.get("symbol") != symbol:
             continue
 
         target = int(record.get("target", 0))
@@ -1036,7 +1089,7 @@ def reset_for_new_session(
     symbol: str,
     event_session_date: str
 ) -> bool:
-    previous_date = state["symbol_session_dates"].get(symbol)
+    previous_date = state["symbol_session_dates"].get(account_symbol_key(symbol))
 
     if previous_date == event_session_date:
         return False
@@ -1048,7 +1101,7 @@ def reset_for_new_session(
     )
 
     clear_symbol_targets(state, symbol, event_session_date)
-    state["symbol_session_dates"][symbol] = event_session_date
+    state["symbol_session_dates"][account_symbol_key(symbol)] = event_session_date
     save_state(state)
     return True
 
@@ -1082,9 +1135,9 @@ def clear_targets_after_external_flat(
 ) -> None:
     today = now_local().date().isoformat()
     clear_symbol_targets(state, symbol, today)
-    state["symbol_session_dates"][symbol] = today
+    state["symbol_session_dates"][account_symbol_key(symbol)] = today
     clear_stop_id(state, symbol)
-    state["last_results"][symbol] = {
+    state["last_results"][account_symbol_key(symbol)] = {
         "status": "targets cleared",
         "symbol": symbol,
         "reason": reason,
@@ -1124,7 +1177,7 @@ def reconcile_symbol(
                 "symbol": symbol,
                 "time": iso_now()
             }
-            state["last_results"][symbol] = result
+            state["last_results"][account_symbol_key(symbol)] = result
             save_state(state)
             log(f"BLOCKED {symbol}: {result['reason']}")
             return result
@@ -1182,7 +1235,7 @@ def reconcile_symbol(
                     "reason": reason,
                     "time": iso_now()
                 }
-                state["last_results"][symbol] = result
+                state["last_results"][account_symbol_key(symbol)] = result
                 save_state(state)
 
                 # Quiet heartbeat, at most once per configured interval.
@@ -1221,7 +1274,7 @@ def reconcile_symbol(
                 "reason": reason,
                 "time": iso_now()
             }
-            state["last_results"][symbol] = result
+            state["last_results"][account_symbol_key(symbol)] = result
             save_state(state)
             return result
 
@@ -1249,7 +1302,7 @@ def reconcile_symbol(
                 "time": iso_now()
             }
             runtime["last_drift_signature"] = None
-            state["last_results"][symbol] = result
+            state["last_results"][account_symbol_key(symbol)] = result
             save_state(state)
             return result
 
@@ -1284,7 +1337,7 @@ def reconcile_symbol(
                 "time": iso_now()
             }
             runtime["last_error"] = result
-            state["last_results"][symbol] = result
+            state["last_results"][account_symbol_key(symbol)] = result
             save_state(state)
             return result
 
@@ -1326,7 +1379,7 @@ def reconcile_symbol(
         runtime["last_error"] = (
             None if status == "synchronized" else result
         )
-        state["last_results"][symbol] = result
+        state["last_results"][account_symbol_key(symbol)] = result
         save_state(state)
 
         log(
@@ -1336,9 +1389,10 @@ def reconcile_symbol(
         return result
 
 def apply_event(event: dict[str, Any]) -> dict[str, Any]:
+    set_current_account(event["account"])
     symbol = event["symbol"]
 
-    with get_symbol_lock(symbol):
+    with get_symbol_lock(account_symbol_key(symbol)):
         state = load_state()
 
         if event["event_id"] in state["processed_events"]:
@@ -1380,7 +1434,7 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
                 event["event_id"],
                 result["status"]
             )
-            state["last_results"][symbol] = result
+            state["last_results"][account_symbol_key(symbol)] = result
             save_state(state)
             return result
 
@@ -1433,7 +1487,7 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
             event["event_id"],
             result["status"]
         )
-        state["last_results"][symbol] = result
+        state["last_results"][account_symbol_key(symbol)] = result
         save_state(state)
 
         return result
@@ -1451,7 +1505,7 @@ def event_worker() -> None:
             log(
                 f"EVENT START: {event['event_id']} | "
                 f"{event['strategy']} {event['signal']} "
-                f"{event['symbol']}"
+                f"{event['symbol']} account={event['account']}"
             )
             result = apply_event(event)
             log(
@@ -1467,7 +1521,7 @@ def event_worker() -> None:
             try:
                 state = load_state()
                 symbol = event.get("symbol", "UNKNOWN")
-                state["last_results"][symbol] = {
+                state["last_results"][account_symbol_key(symbol)] = {
                     "status": "worker error",
                     "message": str(exc),
                     "event_id": event.get("event_id"),
@@ -1488,7 +1542,7 @@ def process_event_direct(event: dict[str, Any]) -> None:
         log(
             f"EVENT START: {event['event_id']} | "
             f"{event['strategy']} {event['signal']} "
-            f"{event['symbol']}"
+            f"{event['symbol']} account={event['account']}"
         )
         result = apply_event(event)
         log(
@@ -1504,7 +1558,7 @@ def process_event_direct(event: dict[str, Any]) -> None:
         try:
             state = load_state()
             symbol = event.get("symbol", "UNKNOWN")
-            state["last_results"][symbol] = {
+            state["last_results"][account_symbol_key(symbol)] = {
                 "status": "direct worker error",
                 "message": str(exc),
                 "event_id": event.get("event_id"),
@@ -1531,9 +1585,10 @@ def reconciler_worker() -> None:
                 market_open() or TRADING_MODE == "SIM"
             ):
                 state = load_state()
-                symbols = known_symbols(state)
+                account_symbols = known_account_symbols(state)
 
-                for symbol in symbols:
+                for account, symbol in account_symbols:
+                    set_current_account(account)
                     if first_pass and not AUTO_RECONCILE_ON_START:
                         continue
 
@@ -1626,7 +1681,11 @@ def health():
             "version": VERSION,
             "mode": TRADING_MODE,
             "token_ok": bool(token),
-            "account_configured": bool(ACCOUNT),
+            "accounts_configured": {
+                "account_1": bool(ACCOUNT_1),
+                "account_2": bool(ACCOUNT_2),
+                "account_3": bool(ACCOUNT_3)
+            },
             "state_file": str(STATE_FILE),
             "legacy_queue_size": event_queue.qsize(),
             "active_event_count": len(queued_event_ids),
@@ -1662,9 +1721,10 @@ def health():
 @app.route("/state", methods=["GET"])
 def state_view():
     state = load_state()
-    symbols_payload: dict[str, Any] = {}
+    accounts_payload: dict[str, Any] = {}
 
-    for symbol in known_symbols(state):
+    for account, symbol in known_account_symbols(state):
+        set_current_account(account)
         desired = desired_net_target(state, symbol)
 
         try:
@@ -1679,49 +1739,39 @@ def state_view():
 
         desired_side, desired_qty = target_to_side_qty(desired)
         actual_side, actual_qty = (
-            target_to_side_qty(actual)
-            if actual is not None
-            else ("UNKNOWN", 0)
+            target_to_side_qty(actual) if actual is not None else ("UNKNOWN", 0)
         )
 
-        symbols_payload[symbol] = {
+        acct = accounts_payload.setdefault(account, {"symbols": {}})
+        acct["symbols"][symbol] = {
             "strategies": strategy_snapshot(state, symbol),
-            "desired_broker": {
-                "signed": desired,
-                "side": desired_side,
-                "qty": desired_qty
-            },
+            "desired_broker": {"signed": desired, "side": desired_side, "qty": desired_qty},
             "actual_broker": {
-                "signed": actual,
-                "side": actual_side,
-                "qty": actual_qty,
-                "average_price": average_price,
-                "error": broker_error
+                "signed": actual, "side": actual_side, "qty": actual_qty,
+                "average_price": average_price, "error": broker_error
             },
             "synchronized": synchronized,
-            "tracked_stop_order_id": get_stop_id(
-                state,
-                symbol
-            ),
-            "runtime": state["symbol_runtime"].get(
-                symbol,
-                {}
-            ),
-            "last_result": state["last_results"].get(
-                symbol
-            )
+            "tracked_stop_order_id": get_stop_id(state, symbol),
+            "runtime": state["symbol_runtime"].get(account_symbol_key(symbol), {}),
+            "last_result": state["last_results"].get(account_symbol_key(symbol))
         }
 
     return jsonify({
         "version": VERSION,
         "mode": TRADING_MODE,
         "time": iso_now(),
-        "symbols": symbols_payload
+        "accounts": accounts_payload
     })
 
 
-@app.route("/reconcile/<symbol>", methods=["POST"])
-def manual_reconcile(symbol: str):
+@app.route("/reconcile/<int:account_num>/<symbol>", methods=["POST"])
+def manual_reconcile(account_num: int, symbol: str):
+    accounts = {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3}
+    account = accounts.get(account_num, "")
+    if not account:
+        return jsonify({"error": "Invalid account number"}), 400
+    set_current_account(account)
+
     resolved = resolve_symbol(symbol)
 
     if not resolved:
@@ -1743,14 +1793,20 @@ def manual_reconcile(symbol: str):
         }), 500
 
 
-@app.route("/flatten/<symbol>", methods=["POST"])
-def flatten(symbol: str):
+@app.route("/flatten/<int:account_num>/<symbol>", methods=["POST"])
+def flatten(account_num: int, symbol: str):
+    accounts = {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3}
+    account = accounts.get(account_num, "")
+    if not account:
+        return jsonify({"error": "Invalid account number"}), 400
+    set_current_account(account)
+
     resolved = resolve_symbol(symbol)
 
     if not resolved:
         return jsonify({"error": "Invalid symbol"}), 400
 
-    with get_symbol_lock(resolved):
+    with get_symbol_lock(account_symbol_key(resolved)):
         try:
             state = load_state()
             today = now_local().date().isoformat()
