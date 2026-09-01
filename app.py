@@ -61,6 +61,7 @@ STRATEGY_ACCOUNT_MAP = {
     # Account 3
     "MNQ 2M BUFFER": ACCOUNT_3,
     "MGC 2M BUFFER": ACCOUNT_3,
+    "MNQ 3m 365": ACCOUNT_3,
 }
 
 MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26").upper().strip()
