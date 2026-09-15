@@ -48,21 +48,15 @@ ACCOUNT_3 = os.getenv("TS_ACCOUNT_3", "").strip()
 
 STRATEGY_ACCOUNT_MAP = {
     # Account 1
-    "MGC 1M": ACCOUNT_1,
-    "MNQ 5M BUFFER": ACCOUNT_1,
-    "ALGOPRO_SIGNALS 5B": ACCOUNT_1,
     "MNQ 2M 365": ACCOUNT_1,
-
+    "MGC 1M alphax": ACCOUNT_1,
+    "MGC 30S Liquidity": ACCOUNT_1,
+    
     # Account 2
-    "MGC 1M BUFFER": ACCOUNT_2,
-    "ALGOPRO_2M A": ACCOUNT_2,
-    "MNQ 1M BUFFER": ACCOUNT_2,
-    "MNQ 1M KAMA": ACCOUNT_2,
     "MNQ 1M 365": ACCOUNT_2,
+    "MNQ 30S BB": ACCOUNT_2,
 
     # Account 3
-    "MNQ 2M BUFFER": ACCOUNT_3,
-    "MGC 2M BUFFER": ACCOUNT_3,
     "MNQ 3M 365": ACCOUNT_3,
     "MGC 2M 365": ACCOUNT_3,
     "MNQ 5M strat lab": ACCOUNT_3,
