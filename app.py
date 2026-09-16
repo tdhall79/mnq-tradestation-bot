@@ -49,8 +49,8 @@ ACCOUNT_3 = os.getenv("TS_ACCOUNT_3", "").strip()
 STRATEGY_ACCOUNT_MAP = {
     # Account 1
     "MNQ 2M 365": ACCOUNT_1,
-    "MGC 1M alphax": ACCOUNT_1,
-    "MGC 30S Liquidity": ACCOUNT_1,
+    "MGC 1M ALPHAX": ACCOUNT_1,
+    "MGC 30S LIQUIDITYy": ACCOUNT_1,
     
     # Account 2
     "MNQ 1M 365": ACCOUNT_2,
@@ -59,7 +59,7 @@ STRATEGY_ACCOUNT_MAP = {
     # Account 3
     "MNQ 3M 365": ACCOUNT_3,
     "MGC 2M 365": ACCOUNT_3,
-    "MNQ 5M strat lab": ACCOUNT_3,
+    "MNQ 5M STRAT LAB": ACCOUNT_3,
 }
 
 MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26").upper().strip()
