@@ -50,7 +50,7 @@ STRATEGY_ACCOUNT_MAP = {
     # Account 1
     "MNQ 2M 365": ACCOUNT_1,
     "MGC 1M ALPHAX": ACCOUNT_1,
-    "MGC 30S LIQUIDITYy": ACCOUNT_1,
+    "MGC 30S LIQUIDITY": ACCOUNT_1,
     
     # Account 2
     "MNQ 1M 365": ACCOUNT_2,
