@@ -23,7 +23,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.5-multi-account-routing"
+VERSION = "6.6-race-safe-multi-account"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -65,8 +65,8 @@ STRATEGY_ACCOUNT_MAP = {
     "MNQ 5M STRAT LAB": ACCOUNT_3,
 }
 
-MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQU26").upper().strip()
-MGC_SYMBOL = os.getenv("MGC_SYMBOL", "MGCQ26").upper().strip()
+MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQZ26").upper().strip()
+MGC_SYMBOL = os.getenv("MGC_SYMBOL", "MGCV26").upper().strip()
 MES_SYMBOL = os.getenv("MES_SYMBOL", "MESU26").upper().strip()
 SIL_SYMBOL = os.getenv("SIL_SYMBOL", "SILQ26").upper().strip()
 
@@ -443,7 +443,9 @@ def runtime_record(
             "last_reconcile_at": None,
             "last_error": None,
             "last_drift_signature": None,
-            "last_heartbeat_epoch": 0.0
+            "last_heartbeat_epoch": 0.0,
+            "last_actual_position": None,
+            "last_actual_observed_at": None
         }
     )
 
@@ -1130,6 +1132,17 @@ def stamp_order_time(
     save_state(state)
 
 
+def record_actual_position(
+    state: dict[str, Any],
+    symbol: str,
+    actual: int
+) -> None:
+    """Remember the last broker position actually observed for this account+symbol."""
+    runtime = runtime_record(state, symbol)
+    runtime["last_actual_position"] = int(actual)
+    runtime["last_actual_observed_at"] = iso_now()
+
+
 def clear_targets_after_external_flat(
     state: dict[str, Any],
     symbol: str,
@@ -1166,7 +1179,10 @@ def reconcile_symbol(
     - Periodic reconciliation only verifies state and maintains an
       unchanged protective stop.
     """
-    with get_symbol_lock(symbol):
+    # Use the same account+symbol lock as apply_event(). This prevents the
+    # periodic monitor from clearing a new TradingView target before its
+    # entry order has been submitted.
+    with get_symbol_lock(account_symbol_key(symbol)):
         state = load_state()
         desired = desired_net_target(state, symbol)
 
@@ -1188,37 +1204,52 @@ def reconcile_symbol(
         actual_before, _ = broker_position(symbol)
         delta = desired - actual_before
         runtime = runtime_record(state, symbol)
+        previous_actual = runtime.get("last_actual_position")
         runtime["last_reconcile_at"] = iso_now()
 
         # PERIODIC / STARTUP MONITORING: never place market orders.
         if not allow_market_order:
-            # A real broker flatten after the order cooldown means the stop
-            # filled or the user manually closed. Clear stale targets.
-            if (
+            # A genuine external flatten requires evidence that the broker
+            # PREVIOUSLY held a non-zero position and is NOW flat. Seeing
+            # desired != 0 and actual == 0 alone is also normal for a fresh
+            # entry before its market order has filled.
+            external_flat = (
                 desired != 0
                 and actual_before == 0
+                and previous_actual is not None
+                and int(previous_actual) != 0
                 and not order_cooldown_active(state, symbol)
-            ):
+            )
+
+            if external_flat:
+                old_actual = int(previous_actual)
                 clear_targets_after_external_flat(
                     state,
                     symbol,
                     reason=(
-                        "broker flat while strategy targets were active; "
-                        "treated as stop/manual close"
+                        f"broker position changed {old_actual:+d}->+0 while "
+                        "strategy targets remained active; treated as "
+                        "stop/manual close"
                     )
                 )
                 log(
-                    f"EXTERNAL FLAT {symbol}: old desired {desired:+d}; "
-                    "targets cleared; waiting for a new webhook"
+                    f"EXTERNAL FLAT {symbol}: broker {old_actual:+d}->+0; "
+                    f"old desired {desired:+d}; targets cleared; "
+                    "waiting for a new webhook"
                 )
                 return {
                     "status": "external flat accepted",
                     "symbol": symbol,
                     "old_desired": desired,
+                    "previous_actual": old_actual,
                     "actual": 0,
                     "reason": reason,
                     "time": iso_now()
                 }
+
+            # Preserve this observation for the next monitor pass. This is
+            # deliberately done after the external-flat test.
+            record_actual_position(state, symbol, actual_before)
 
             # When synchronized, only ensure the current stop exists.
             if delta == 0:
@@ -1287,6 +1318,8 @@ def reconcile_symbol(
             f"actual={actual_before:+d} delta={delta:+d} | {reason}"
         )
 
+        record_actual_position(state, symbol, actual_before)
+
         if delta == 0:
             stop_result = place_protective_stop(
                 state,
@@ -1349,6 +1382,7 @@ def reconcile_symbol(
             desired,
             POSITION_SETTLE_SECONDS
         )
+        record_actual_position(state, symbol, actual_after)
 
         stop_target = desired if actual_after == desired else actual_after
         stop_result = place_protective_stop(
@@ -1814,7 +1848,7 @@ def flatten(account_num: int, symbol: str):
             state = load_state()
             today = now_local().date().isoformat()
             clear_symbol_targets(state, resolved, today)
-            state["symbol_session_dates"][resolved] = today
+            state["symbol_session_dates"][account_symbol_key(resolved)] = today
             save_state(state)
 
             result = reconcile_symbol(
