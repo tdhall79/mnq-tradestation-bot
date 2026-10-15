@@ -49,7 +49,7 @@ ACCOUNT_3 = os.getenv("TS_ACCOUNT_3", "").strip()
 STRATEGY_ACCOUNT_MAP = {
     # Account 1
     "MGC 30S LIQUIDITY": ACCOUNT_1,
-    "MGC 1M FVG": ACCOUNT_1,
+    "MGC 30S FVG": ACCOUNT_1,
     "MNQ 30S EVOX": ACCOUNT_1,
     
     # Account 2
@@ -59,10 +59,11 @@ STRATEGY_ACCOUNT_MAP = {
     "MNQ 30S FVG": ACCOUNT_2,
     "MNQ 30S ADAPTIVE": ACCOUNT_2,
     "MNQ 15S ZERO LAG": ACCOUNT_2,
+    "MNQ 15S VOLUME": ACCOUNT_2,
 
     # Account 3
     
-    "MNQ 30S %BB": ACCOUNT_3,
+    "MNQ 30S BB": ACCOUNT_3,
     "MGC 30S GAMMA": ACCOUNT_3,
 }
 
