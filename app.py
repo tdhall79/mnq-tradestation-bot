@@ -65,6 +65,7 @@ STRATEGY_ACCOUNT_MAP = {
     
     "MNQ 30S BB": ACCOUNT_3,
     "MGC 30S GAMMA": ACCOUNT_3,
+    "MNQ 30S BAND BO": ACCOUNT_3,
 }
 
 MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQZ26").upper().strip()
