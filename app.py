@@ -51,6 +51,7 @@ STRATEGY_ACCOUNT_MAP = {
     "MGC 30S LIQUIDITY": ACCOUNT_1,
     "MGC 30S FVG": ACCOUNT_1,
     "MNQ 30S EVOX": ACCOUNT_1,
+    "MNQ 30S BB": ACCOUNT_1,
     
     # Account 2
     "SIL 15S FVG": ACCOUNT_2,
@@ -63,9 +64,12 @@ STRATEGY_ACCOUNT_MAP = {
 
     # Account 3
     
-    "MNQ 30S BB": ACCOUNT_3,
+    
     "MGC 30S GAMMA": ACCOUNT_3,
     "MNQ 30S BAND BO": ACCOUNT_3,
+    "MNQ 5M VOL": ACCOUNT_3,
+    "MNQ 5M PULLBACK": ACCOUNT_3,
+    "MNQ 5M LIQUIDITY": ACCOUNT_3,
 }
 
 MNQ_SYMBOL = os.getenv("MNQ_SYMBOL", "MNQZ26").upper().strip()
