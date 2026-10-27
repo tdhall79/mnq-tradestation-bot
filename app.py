@@ -23,7 +23,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.6-race-safe-multi-account"
+VERSION = "6.7-algopro-v1-7-account1"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -48,6 +48,7 @@ ACCOUNT_3 = os.getenv("TS_ACCOUNT_3", "").strip()
 
 STRATEGY_ACCOUNT_MAP = {
     # Account 1
+    "ALGOPRO V1.7": ACCOUNT_1,
     "MNQ 30S QUANTUM": ACCOUNT_1,
     "MNQ 1M PIVOT": ACCOUNT_1,
     "MNQ 30S NEXUS": ACCOUNT_1,
@@ -531,6 +532,12 @@ def normalize_signal(value: Any) -> str | None:
     if signal in {"SESSION END", "SESSION_END"}:
         return "EXIT"
 
+    if signal in {"BUY TP", "BUY TAKE PROFIT", "BUY_TP", "LONG TP", "LONG_TP"}:
+        return "BUY_TP"
+
+    if signal in {"SELL TP", "SELL TAKE PROFIT", "SELL_TP", "SHORT TP", "SHORT_TP"}:
+        return "SELL_TP"
+
     return signal.replace(" ", "_")
 
 
@@ -581,7 +588,7 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         raise ValueError("Missing symbol")
 
-    if signal not in {"LONG", "SHORT", "EXIT", "EXIT_SHORT"}:
+    if signal not in {"LONG", "SHORT", "EXIT", "EXIT_SHORT", "BUY_TP", "SELL_TP"}:
         raise ValueError(f"Unknown signal: {signal}")
 
     if not strategy:
@@ -1477,7 +1484,7 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
             target = event["contracts"]
         elif event["signal"] == "SHORT":
             target = -event["contracts"]
-        elif event["signal"] in {"EXIT", "EXIT_SHORT"}:
+        elif event["signal"] in {"EXIT", "EXIT_SHORT", "BUY_TP", "SELL_TP"}:
             target = 0
         else:
             raise ValueError(
@@ -1485,6 +1492,31 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
             )
 
         old_target = int(current.get("target", 0))
+
+        # Direction-specific take-profit alerts only flatten the strategy that
+        # generated them, and only if it is still in the expected direction.
+        # A delayed BUY_TP must never flatten a new SHORT (and vice versa).
+        # Keep generic EXIT / EXIT_SHORT semantics unchanged for existing bots.
+        if event["signal"] in {"BUY_TP", "SELL_TP"}:
+            expected_direction = 1 if event["signal"] == "BUY_TP" else -1
+            if old_target * expected_direction <= 0:
+                result = {
+                    "status": "take profit ignored - no matching strategy position",
+                    "event_id": event["event_id"],
+                    "strategy": event["strategy"],
+                    "signal": event["signal"],
+                    "symbol": symbol,
+                    "old_strategy_target": old_target,
+                    "new_strategy_target": old_target,
+                    "reason": "TP direction does not match current strategy target",
+                    "time": iso_now()
+                }
+                mark_event_processed(state, event["event_id"], result["status"])
+                state["last_results"][account_symbol_key(symbol)] = result
+                save_state(state)
+                log(f"TP IGNORED {symbol}: {event['strategy']} "
+                    f"{event['signal']} current_target={old_target:+d}")
+                return result
 
         set_strategy_target(
             state,
@@ -1894,7 +1926,7 @@ def webhook():
         return jsonify({"error": str(exc)}), 400
 
     if ENABLE_SESSION_FILTER and not market_open():
-        if event["signal"] not in {"EXIT", "EXIT_SHORT"}:
+        if event["signal"] not in {"EXIT", "EXIT_SHORT", "BUY_TP", "SELL_TP"}:
             return jsonify({
                 "status": "session closed",
                 "event_id": event["event_id"]
