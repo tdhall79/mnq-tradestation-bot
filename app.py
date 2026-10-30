@@ -57,6 +57,7 @@ STRATEGY_ACCOUNT_MAP = {
     "MNQ 15M ATR": ACCOUNT_2,
     "MNQ 15M VWAP": ACCOUNT_2,
     "ALGOPRO V1.7 30S": ACCOUNT_2,
+    "MGC AGPRO 1.7": ACCOUNT_2,
 
 
     # Account 3    
