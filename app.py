@@ -23,7 +23,7 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================================================
 
-VERSION = "6.7-algopro-v1-7-account1"
+VERSION = "6.9-mode-isolated-generic-sim"
 
 TZ_NAME = os.getenv("BOT_TIMEZONE", "America/Chicago")
 TZ = pytz.timezone(TZ_NAME)
@@ -32,6 +32,8 @@ SESSION_START = time(7, 00)
 SESSION_END = time(14, 59)
 
 TRADING_MODE = os.getenv("TRADING_MODE", "SIM").upper().strip()
+if TRADING_MODE not in {"SIM", "LIVE"}:
+    raise RuntimeError("TRADING_MODE must be explicitly SIM or LIVE")
 BASE_URL = (
     "https://api.tradestation.com/v3"
     if TRADING_MODE == "LIVE"
@@ -45,6 +47,7 @@ REFRESH_TOKEN = os.getenv("TS_REFRESH_TOKEN", "").strip()
 ACCOUNT_1 = os.getenv("TS_ACCOUNT_1", "").strip()
 ACCOUNT_2 = os.getenv("TS_ACCOUNT_2", "").strip()
 ACCOUNT_3 = os.getenv("TS_ACCOUNT_3", "").strip()
+SIM_ACCOUNT = os.getenv("TS_SIM_ACCOUNT", "").strip()
 
 STRATEGY_ACCOUNT_MAP = {
     # Account 1
@@ -114,8 +117,13 @@ STALE_EVENT_TOLERANCE_MS = int(
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
-STATE_FILE = Path(
-    os.getenv("STATE_FILE", "/tmp/strategy_state_v5_1.json")
+# Keep the existing STATE_FILE environment variable as the LIVE file.
+# Derive an isolated, persistent SIM filename in the same directory automatically.
+LIVE_STATE_FILE = Path(os.getenv("STATE_FILE", "/var/data/strategy_state_v5_1.json"))
+STATE_FILE = (
+    LIVE_STATE_FILE.with_name(f"{LIVE_STATE_FILE.stem}_sim{LIVE_STATE_FILE.suffix}")
+    if TRADING_MODE == "SIM"
+    else LIVE_STATE_FILE
 )
 
 # =========================================================
@@ -233,9 +241,17 @@ def normalize_strategy_name(value: Any) -> str:
 
 def account_for_strategy(strategy: str) -> str:
     key = normalize_strategy_name(strategy)
+    if not key:
+        raise ValueError("Strategy name is required")
+    if TRADING_MODE == "SIM":
+        # Any explicitly named strategy is allowed in SIM; all share one SIM account.
+        if not SIM_ACCOUNT:
+            raise ValueError("TS_SIM_ACCOUNT is required in SIM mode")
+        return SIM_ACCOUNT
+    # LIVE stays allowlisted through the existing strategy/account mapping.
     account = STRATEGY_ACCOUNT_MAP.get(key, "")
     if not account:
-        raise ValueError(f"No TradeStation account route configured for strategy: {strategy}")
+        raise ValueError(f"No LIVE TradeStation account route configured for strategy: {strategy}")
     return account
 
 def strategy_key(symbol: str, strategy: str) -> str:
@@ -670,18 +686,20 @@ def parse_event(data: dict[str, Any]) -> dict[str, Any]:
 # =========================================================
 
 def validate_environment() -> None:
-    missing = [
-        name
-        for name, value in {
-            "TS_CLIENT_ID": CLIENT_ID,
-            "TS_CLIENT_SECRET": CLIENT_SECRET,
-            "TS_REFRESH_TOKEN": REFRESH_TOKEN,
+    required = {
+        "TS_CLIENT_ID": CLIENT_ID,
+        "TS_CLIENT_SECRET": CLIENT_SECRET,
+        "TS_REFRESH_TOKEN": REFRESH_TOKEN,
+    }
+    if TRADING_MODE == "SIM":
+        required["TS_SIM_ACCOUNT"] = SIM_ACCOUNT
+    else:
+        required.update({
             "TS_ACCOUNT_1": ACCOUNT_1,
             "TS_ACCOUNT_2": ACCOUNT_2,
-            "TS_ACCOUNT_3": ACCOUNT_3
-        }.items()
-        if not value
-    ]
+            "TS_ACCOUNT_3": ACCOUNT_3,
+        })
+    missing = [name for name, value in required.items() if not value]
 
     if missing:
         raise RuntimeError(
@@ -772,11 +790,16 @@ def broker_position(
             else None
         )
 
-        if long_short.startswith("LONG") or raw_qty > 0:
-            return qty, average_price
-
-        if long_short.startswith("SHORT") or raw_qty < 0:
+        # TradeStation may report a positive absolute Quantity for shorts.
+        # The explicit LongShort field takes precedence over its sign.
+        if long_short.startswith("SHORT"):
             return -qty, average_price
+        if long_short.startswith("LONG"):
+            return qty, average_price
+        if raw_qty < 0:
+            return -qty, average_price
+        if raw_qty > 0:
+            return qty, average_price
 
     return 0, None
 
@@ -1497,6 +1520,27 @@ def apply_event(event: dict[str, Any]) -> dict[str, Any]:
 
         old_target = int(current.get("target", 0))
 
+        # SIM strategies: an exit only closes its matching direction.
+        # Existing LIVE strategy EXIT behavior is deliberately unchanged.
+        if TRADING_MODE == "SIM":
+            if event["signal"] in {"EXIT", "EXIT_SHORT", "BUY_TP", "SELL_TP"}:
+                expected_direction = 1 if event["signal"] in {"EXIT", "BUY_TP"} else -1
+                if old_target * expected_direction <= 0:
+                    result = {
+                        "status": "directional exit ignored - no matching strategy position",
+                        "event_id": event["event_id"],
+                        "strategy": event["strategy"],
+                        "signal": event["signal"],
+                        "symbol": symbol,
+                        "old_strategy_target": old_target,
+                        "new_strategy_target": old_target,
+                        "time": iso_now(),
+                    }
+                    mark_event_processed(state, event["event_id"], result["status"])
+                    state["last_results"][account_symbol_key(symbol)] = result
+                    save_state(state)
+                    return result
+
         # Direction-specific take-profit alerts only flatten the strategy that
         # generated them, and only if it is still in the expected direction.
         # A delayed BUY_TP must never flatten a new SHORT (and vice versa).
@@ -1755,7 +1799,8 @@ def health():
             "accounts_configured": {
                 "account_1": bool(ACCOUNT_1),
                 "account_2": bool(ACCOUNT_2),
-                "account_3": bool(ACCOUNT_3)
+                "account_3": bool(ACCOUNT_3),
+                "sim_account": bool(SIM_ACCOUNT)
             },
             "state_file": str(STATE_FILE),
             "legacy_queue_size": event_queue.qsize(),
@@ -1837,7 +1882,7 @@ def state_view():
 
 @app.route("/reconcile/<int:account_num>/<symbol>", methods=["POST"])
 def manual_reconcile(account_num: int, symbol: str):
-    accounts = {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3}
+    accounts = ({1: SIM_ACCOUNT} if TRADING_MODE == "SIM" else {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3})
     account = accounts.get(account_num, "")
     if not account:
         return jsonify({"error": "Invalid account number"}), 400
@@ -1866,7 +1911,7 @@ def manual_reconcile(account_num: int, symbol: str):
 
 @app.route("/flatten/<int:account_num>/<symbol>", methods=["POST"])
 def flatten(account_num: int, symbol: str):
-    accounts = {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3}
+    accounts = ({1: SIM_ACCOUNT} if TRADING_MODE == "SIM" else {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3})
     account = accounts.get(account_num, "")
     if not account:
         return jsonify({"error": "Invalid account number"}), 400
